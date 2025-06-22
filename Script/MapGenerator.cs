@@ -6,9 +6,11 @@ using UnityEngine;
 using System.Collections.Generic;
 
 public class MapGenerator : MonoBehaviour {
+    /**
+    * param: mapLayout {string} -> B = BUILDING, R = ROAD, M = MAT, . = EMPTY, W = WAREHOUSE.
+    */
     public GameObject roadPrefab, buildingPrefab, warehousePrefab, spawnMarkerPrefab, garageDoorPrefab, loadingSpotPrefab;
     
-    public Vector2Int mapSize = new Vector2Int(45,37);
     string[] mapLayout = new string[]
     {
         "..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
@@ -49,14 +51,21 @@ public class MapGenerator : MonoBehaviour {
         ".BBBBBB..MS..MS..MS..MS..MS..BBBBBBBBBBBBBBB",
         ".........MM..MM..MM..MM..MM..BBBBBBBBBBBBBBB",
     };
-    public List<Vector3> spawnPoints = new List<Vector3>();
-    public List<Transform> warehouseTargets = new List<Transform>();
+    public Vector2Int mapSize = new Vector2Int(45,37); // TODO: Change to dynamic
+
+    public List<Vector3> spawnPoints = new List<Vector3>(); // Public exposed list for spawnpoints
+    public List<Transform> warehouseTargets = new List<Transform>(); // Public exposed list for warehouse targets
 
     void Start() {
+        // On start generate map
         GenerateMap();
+        mapSize = new Vector2Int(mapLayout[0].Length, mapLayout.Length);
+        Debug.Log($"Map size: {mapSize}");
     }
     void GenerateMap() {
+        // Foreach row
         for (int y = 0; y < mapLayout.Length; y++) {
+            // foreach column
             var line = mapLayout[y];
             for (int x = 0; x < line.Length; x++) {
                 Vector3 pos = new Vector3(x + 0.5f, 0f, mapLayout.Length - y - 1 + .5f); // Flip y to z
@@ -66,23 +75,22 @@ public class MapGenerator : MonoBehaviour {
                         GameObject road = Instantiate(roadPrefab, pos + new Vector3(0, 0.05f, 0), Quaternion.identity, transform);
                         road.transform.localScale = new Vector3(1f, 0.1f, 1f);
                         break;
-                    case 'B':
+                    case 'B': // Building
                         var b = Instantiate(buildingPrefab, pos + new Vector3(0, 0.5f, 0), Quaternion.identity, transform);
                         b.layer = LayerMask.NameToLayer("Unwalkable");
                         break;
-                    case 'W':
+                    case 'W': // Warehouse
                         GameObject warehouse = Instantiate(warehousePrefab, pos, Quaternion.identity, transform);
                         warehouse.name = $"Warehouse_{warehouseTargets.Count + 1}";
-                        bool hasRoad = HasAdjacentRoad(x,y);
-                        if(hasRoad) OpenDoorOnWarehouse(warehouse, x, y);
+                        if(HasAdjacentRoad(x,y)) OpenDoorOnWarehouse(warehouse, x, y);
                         Transform targetPoint = warehouse.transform.Find("TargetPoint");
                         if(targetPoint != null) warehouseTargets.Add(targetPoint);
                         break;
-                    case 'S':
+                    case 'S': // Spawnpoint
                         Instantiate(roadPrefab, pos + new Vector3(0, 0.05f, 0), Quaternion.identity, transform);
                         spawnPoints.Add(pos + Vector3.up * 0.5f); // Raise agent a bit
                         break;
-                    case '.':
+                    case '.': // empty blocker
                         GameObject blocker = GameObject.CreatePrimitive(PrimitiveType.Cube);
                         blocker.transform.position = pos + new Vector3(0, 0.5f, 0);
                         blocker.transform.localScale = new Vector3(.9f,1f,.9f);
@@ -90,7 +98,7 @@ public class MapGenerator : MonoBehaviour {
                         DestroyImmediate(blocker.GetComponent<Renderer>()); // make it invisible
                         blocker.transform.parent = transform;
                         break;
-                    case 'M':
+                    case 'M': // Mat
                         var m = Instantiate(loadingSpotPrefab, pos + new Vector3(0, 0.025f, 0), Quaternion.identity, transform);
                         m.layer = LayerMask.NameToLayer("Unwalkable");
                         break;
@@ -98,6 +106,10 @@ public class MapGenerator : MonoBehaviour {
             }
         }
     }
+    /**
+    * Private method for Warehouse,
+    * Returns if warehouse on each wall, NSWE has an adjacentRoad.
+    */
     bool HasAdjacentRoad(int x, int y) {
         int[,] dirs = { {0,1}, {1,0}, {0,-1}, {-1,0} };
         for (int i = 0; i < dirs.GetLength(0); i++) {
@@ -111,6 +123,10 @@ public class MapGenerator : MonoBehaviour {
         }
         return false;
     }
+    /**
+    * Private method for Warehouse
+    * Responsible for door spawning on the adjacent road.
+    */
     void OpenDoorOnWarehouse(GameObject warehouse, int x, int y) {
         Dictionary<Vector2Int, (string wallName, float angle)> directions = new Dictionary<Vector2Int, (string,float)> {
             { new Vector2Int(0, 1), ("Wall_N", 0f) },
