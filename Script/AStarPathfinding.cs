@@ -120,7 +120,7 @@ public static class AStarPathfinder {
                 }
                 // also check if we are swapping with another agent
                 if (reservationTable.ContainsKey(newTimestep) &&
-                    reservationTable[newTimestep].ContainsKey(currentPathNode) &&
+                    reservationTable[newTimestep].ContainsKey(currentPathNode.node) &&
                     reservationTable.ContainsKey(currentPathNode.timestep) &&
                     reservationTable[currentPathNode.timestep].ContainsKey(neighbourNode)) {
                         if (reservationTable[newTimestep][currentPathNode.node] != agentId &&
@@ -138,7 +138,7 @@ public static class AStarPathfinder {
                 
                 PathNode neighbourPathNode = new PathNode(neighbourNode, newTimestep, gCost, hCost, currentPathNode);
 
-                if(!openSet.Contains(neighbourPathNode)) openSet.Add(neighborPathNode); // could be improve with a PriorityQueue;
+                if(!openSet.Contains(neighbourPathNode)) openSet.Add(neighbourPathNode); // could be improve with a PriorityQueue;
                 allNodes[key] = neighbourPathNode;
             }
             /**
@@ -163,7 +163,7 @@ public static class AStarPathfinder {
     */
     private static List<Node> RetracePath(PathNode endPathNode) {
         List<Node> path = new List<Node>();
-        Node currentPathNode = endPathNode;
+        PathNode currentPathNode = endPathNode;
         while (currentPathNode != null) {
             path.Add(currentPathNode.node);
             currentPathNode = currentPathNode.parent;
