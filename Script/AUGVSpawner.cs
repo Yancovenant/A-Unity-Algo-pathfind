@@ -12,28 +12,19 @@ public class AUGVSpawner : MonoBehaviour {
     public MapGenerator mapGenerator; // assign the map generator in inspector
     public List<GameObject> agents; // exposed public agents list
 
-    void Start() {
-        // avoid playing without this dependencies
-        // [augvPrefab, Mapgenerator]
+    // Remove Start()
+    // Add public SpawnAgents() method
+    public void SpawnAgents() {
         if (augvPrefab == null || mapGenerator == null) {
             Debug.LogError("AUGV Prefab or MapGenerator is not assigned.");
             return;
         }
-        // We will create a placeholder for each of spawn points
-        // to get its position only
         GameObject spawnContainer = new GameObject("LoadingSpots");
         int i = 1;
         foreach (Vector3 spawnPos in mapGenerator.spawnPoints) {
-            // instantiate AUGV prefab to available spawn points.
             GameObject augv = Instantiate(augvPrefab, spawnPos, Quaternion.identity);
             augv.name = "AUGV_" + i;
             agents.Add(augv);
-
-            /* 
-            * this would be responsible to act as a Proxy
-            * because on the route this loadingspot/deck, could sometime be included
-            * in the overall route of agent.
-            */
             GameObject spawnPointObj = new GameObject($"AUGV_{i}_Loadingspot");
             spawnPointObj.transform.position = spawnPos;
             spawnPointObj.transform.parent = spawnContainer.transform;
