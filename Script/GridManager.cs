@@ -11,23 +11,17 @@ public class GridManager : MonoBehaviour {
     public Vector2 gridWorldSize; // Size of the grid in world units, tweak on inspector // TODO: Change to dynamic
     public float nodeRadius; // Radius of the nodes, tweak on inspector // TODO: Change to dynamic
 
-    Node[,] grid; // Grid array
+    public Node[,] grid; // Make grid public for supervisor access
     float nodeDiameter; // Diameter of the nodes
     int gridSizeX, gridSizeY; // Size of the grid in nodes
+    public bool gridReady = false;
 
-    void Awake() {
-        // Invoke CreateGrid after .1f to avoid race overlapping between mapGenerator and this script;
-        Invoke(nameof(CreateGrid), .1f);
-
-        // Calculate nodeDiameter, gridSizeX, gridSizeY;
+    // Remove Awake/Start grid creation
+    // Add public CreateGrid() method
+    public void CreateGrid() {
         nodeDiameter = nodeRadius * 2;
         gridSizeX = Mathf.RoundToInt(gridWorldSize.x / nodeDiameter);
         gridSizeY = Mathf.RoundToInt(gridWorldSize.y / nodeDiameter);
-
-        // Create the grid
-        CreateGrid();
-    }
-    void CreateGrid() {
         // Check if nodeRadius is valid
         if (nodeRadius <= 0) {
             Debug.LogError("Node radius harus lebih dari 0");
@@ -48,6 +42,8 @@ public class GridManager : MonoBehaviour {
                 grid[x, y] = new Node(walkable, worldPoint, x, y); // Create the node
             }
         }
+        gridReady = true;
+        Debug.Log($"grid ready {grid.GetHashCode()}");
     }
 
     /**
@@ -55,17 +51,22 @@ public class GridManager : MonoBehaviour {
     */
     public Node NodeFromWorldPoint(Vector3 worldPosition) {
         // update
-        float percentX = (worldPosition.x + gridWorldSize.x / 2) / gridWorldSize.x;
-        float percentY = (worldPosition.z + gridWorldSize.y / 2) / gridWorldSize.y;
-        percentX = Mathf.Clamp01(percentX);
-        percentY = Mathf.Clamp01(percentY);
+        /*
+        float percentX = Mathf.Clamp01((worldPosition.x) / (gridSizeX));
+        float percentY = Mathf.Clamp01((worldPosition.z) / (gridSizeY));
         /*
         float percentX = Mathf.Clamp01((worldPosition.x) / gridWorldSize.x);
         float percentY = Mathf.Clamp01((worldPosition.z / gridWorldSize.y)); // invert Z
-        */
+        /
         int x = Mathf.RoundToInt((gridSizeX - 1) * percentX);
         int y = Mathf.RoundToInt((gridSizeY - 1) * percentY);
+        */
+        int x = Mathf.FloorToInt(worldPosition.x);
+        int y = Mathf.FloorToInt(worldPosition.z);
 
+        // Clamp to grid bounds
+        x = Mathf.Clamp(x, 0, gridSizeX - 1);
+        y = Mathf.Clamp(y, 0, gridSizeY - 1);
         return grid[x, y];
     }
 
@@ -90,19 +91,18 @@ public class GridManager : MonoBehaviour {
     * but now we are using the PathCoordinator.cs to handle the reservation, recomputing etc.
     */
     // DELETED
-/*
 #if UNITY_EDITOR
     void OnDrawGizmos() {
+        // Draw grid bounds
         Vector3 gizmoCenter = transform.position + new Vector3(gridWorldSize.x, 0, gridWorldSize.y) * .5f;
+        Gizmos.color = Color.yellow;
         Gizmos.DrawWireCube(gizmoCenter, new Vector3(gridWorldSize.x, .1f, gridWorldSize.y));
         if (grid != null) {
             foreach (var n in grid) {
-                Gizmos.color = n.walkable ? Color.white : Color.red;
-                if(path != null && path.Contains(n)) Gizmos.color = Color.black;
-                Gizmos.DrawCube(n.worldPosition, new Vector3(1, .1f, 1));
+                //Gizmos.color = n.walkable ? Color.green : Color.red;
+                //Gizmos.DrawCube(n.worldPosition, new Vector3(0.9f, 0.1f, 0.9f));
             }
         }
     }
 #endif
-*/
 }
