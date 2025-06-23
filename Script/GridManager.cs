@@ -36,7 +36,9 @@ public class GridManager : MonoBehaviour {
         grid = new Node[gridSizeX, gridSizeY];
         // as for the naming convention,
         // i dont exactly know what is the best naming convention for this,
+        // so use at ur own risk.
         Vector3 startPos = transform.position;
+
         for (int x = 0; x < gridSizeX; x++) { // foreach column
             for (int y = 0; y < gridSizeY; y++) { // foreach row
                 Vector3 worldPoint = startPos +
@@ -52,9 +54,15 @@ public class GridManager : MonoBehaviour {
     * Returns the node from a world position.
     */
     public Node NodeFromWorldPoint(Vector3 worldPosition) {
+        // update
+        float percentX = (worldPosition.x + gridWorldSize.x / 2) / gridWorldSize.x;
+        float percentY = (worldPosition.z + gridWorldSize.y / 2) / gridWorldSize.y;
+        percentX = Mathf.Clamp01(percentX);
+        percentY = Mathf.Clamp01(percentY);
+        /*
         float percentX = Mathf.Clamp01((worldPosition.x) / gridWorldSize.x);
         float percentY = Mathf.Clamp01((worldPosition.z / gridWorldSize.y)); // invert Z
-
+        */
         int x = Mathf.RoundToInt((gridSizeX - 1) * percentX);
         int y = Mathf.RoundToInt((gridSizeY - 1) * percentY);
 
@@ -66,12 +74,10 @@ public class GridManager : MonoBehaviour {
     */
     public List<Node> GetNeighbours(Node node) {
         List<Node> neighbours = new List<Node>();
-        int[,] directions = new int[,] {{1,0}, {-1,0}, {0,1}, {0,-1}};
+        int[,] directions = new int[,] {{1,0}, {-1,0}, {0,1}, {0,-1}}; // 4-directional movement;
         for (int i = 0; i < directions.GetLength(0); i++) {
-            int dx = directions[i,0];
-            int dy = directions[i,1];
-            int checkX = node.gridX + dx;
-            int checkY = node.gridY + dy;
+            int checkX = node.gridX + directions[i,0];
+            int checkY = node.gridY + directions[i,1];
             if (checkX >= 0 && checkX < gridSizeX && checkY >= 0 && checkY < gridSizeY) neighbours.Add(grid[checkX, checkY]);
         }
         return neighbours;
@@ -83,35 +89,7 @@ public class GridManager : MonoBehaviour {
     * this responsible for before @see:AStarPathfinding.cs, to reserve a path for agent,
     * but now we are using the PathCoordinator.cs to handle the reservation, recomputing etc.
     */
-    public Node[,] GetGrid() => grid;
-    public List<Node> path;
-
-    Dictionary<Node, string> reservedNodes = new Dictionary<Node, string>(); // Dictionary for reserved nodes
-
-    /**
-    * Reserve a path for an agent.
-    */
-    public void ReservePath(List<Node> path, string agentId) {
-        foreach (Node node in path) {
-            reservedNodes[node] = agentId;
-        }
-    }
-    /**
-    * Release a path for an agent.
-    */
-    public void ReleasePath(List<Node> path, string agentId) {
-        foreach (Node node in path) {
-            if(reservedNodes.ContainsKey(node) && reservedNodes[node] == agentId) {
-                reservedNodes.Remove(node);
-            }
-        }
-    }
-    /**
-    * Returns true if the node is reserved by another agent.
-    */
-    public bool IsReservedByOther(Node node, string agentId) {
-        return reservedNodes.ContainsKey(node) && reservedNodes[node] != agentId;
-    }
+    // DELETED
 /*
 #if UNITY_EDITOR
     void OnDrawGizmos() {
