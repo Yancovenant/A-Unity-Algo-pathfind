@@ -4,6 +4,12 @@
 * Using A* algorithm.
 */
 
+/**
+/* TODO: CHANGE THIS INTO UNITY ENGINE AI PATHFIND
+/* I JUST GET TO KNOW THAT UNITY PATHFIND IS USING A*
+/* FALL BACK AND ADD GENTLE REMINDER
+/*/
+
 using UnityEngine;
 using System.Collections.Generic;
 
