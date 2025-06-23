@@ -78,9 +78,9 @@ public class AUGVAgent : MonoBehaviour {
                         Vector3 direction = (targetPos - transform.position).normalized;
                         if (direction != Vector3.zero) {
                             Quaternion targetRot = Quaternion.LookRotation(direction);
-                            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, rotationSpeed * Time.deltaTime);
+                            transform.rotation = Quaternion.Slerp(transform.rotation, targetRot, rotationSpeed * Time.deltaTime);
                         }
-                        transform.position = Vector3.MoveTowards(transform.position, targetPos, moveSpeed * time.deltaTime);
+                        transform.position = Vector3.MoveTowards(transform.position, targetPos, moveSpeed * Time.deltaTime);
                         yield return null;
                     }
                     transform.position = targetPos;
