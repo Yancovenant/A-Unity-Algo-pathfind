@@ -3,6 +3,7 @@
 * - Delegates all path logic and computing to PathCoordinator
 * - Performs dynamic path request and collision aware movement
 */
+// UPDATE: REFACTORED FOR SIMPLICITY
 
 using UnityEngine;
 using System.Collections.Generic;
@@ -14,12 +15,10 @@ public class AUGVAgent : MonoBehaviour {
     
     private Queue<Vector3> waypointQueue = new Queue<Vector3>();
     private Coroutine moveCoroutine;
-    private Vector3? currentTarget = null;
     private string agentId;
 
     private List<Node> currentPath = new List<Node>();
-    private int stepIndex = 0;
-    private bool forcedStepMode = false;
+    private int stepIndex = 0; // this is now our master "timestep" for this agent.
 
     private void Start() {
         agentId = gameObject.name;
@@ -31,7 +30,7 @@ public class AUGVAgent : MonoBehaviour {
     * and starts the coroutine to move through them.
     */
     public void SetWaypointQueue(List<Vector3> waypoints) {
-        if (moveCoroutine != null) StopCoroutine(moveCoroutine);
+        if (moveCoroutine != null) StopCoroutine(moveCoroutine); // stop and immidiatly go to new route
         waypointQueue = new Queue<Vector3>(waypoints);
         moveCoroutine = StartCoroutine(FollowWaypointsCoroutine());
     }
@@ -42,181 +41,64 @@ public class AUGVAgent : MonoBehaviour {
     * - Follow the path (node);
     * - Wait at the waypoint position for a short delay.
     */
+    // ==== bug fixes: the augv main logic loop is now much more simpler!
     IEnumerator FollowWaypointsCoroutine() {
         while (waypointQueue.Count > 0) {
             Vector3 nextWayPoint = waypointQueue.Dequeue();
-            currentPath = PathCoordinator.Instance.RequestPath(agentId, transform.position, nextWayPoint);
-            //List<Node> path = AStarPathfinder.FindPath(grid, RoundVec3(transform.position), RoundVec3(nextWayPoint));
-            if (currentPath == null || currentPath.Count == 0) {
-                Debug.LogWarning($"[{agentId}] No path found to {nextWayPoint}");
-                yield break;
+
+            // ---- pathfinding loop ---
+            // Will keep on trying to find a path until one is available.
+            while (currentPath == null || currentPath.Count == 0) {
+                currentPath = PathCoordinator.Instance.RequestPath(agentId, transform.position, nextWayPoint);
+                if (currentPath == null || currentPath.Count == 0) {
+                    // no path found. the coordinator has determined it's impossible to move without conflict ight now.
+                    // So, we wait and try again. The world will have changed by the next attempt.
+                    Debug.Log($"[{agentId}] is waiting because no path could be found...");
+                    yield return new WaitForSeconds(0.5f); // wait for half a second before retrying.
+                }
             }
-            stepIndex = 0;
-            
-            while (stepIndex < currentPath.Count) {
-                Node node = currentPath[stepIndex];
+
+            // -- movement loop ---
+            // Once a path is secured, we will just follow it. it is guaranteed to be conflict-free;
+            // no more complex real-time conflict checks are needed here.
+            for (int i = 0; i < currentPath.Count; i++) {
+                Node node = currentPath[i];
+                // we set the target position of the node,
+                // while not using the y position, because we are not moving up and down,
+                // we are either a car or a robot. not a plane.
                 Vector3 targetPos = new Vector3(node.worldPosition.x, transform.position.y, node.worldPosition.z);
-                
-                // Check Realtime Dynamic Conflict
-                if (PathCoordinator.Instance.IsNodeOccupied(node) ||
-                    PathCoordinator.Instance.ShouldYieldToOtherAgent(agentId, node, currentPath)
-                ) {
-                    //Debug.Log($"[{agentId}] yielding at {node.gridX},{node.gridY}");
-                    yield return new WaitForSeconds(.3f);
-                    //PathCoordinator.Instance.TryResolveBlockage(agentId, node);
-                    currentPath = PathCoordinator.Instance.RequestPath(agentId, transform.position, nextWayPoint);
-                    if(currentPath == null || currentPath.Count == 0) yield break;
-                    stepIndex = 0;
-                    continue;
-                }
 
-                // Conflict Prediction
-                /*
-                if (PathCoordinator.Instance.PredictConflict(agentId, currentPath)) {
-                    if(PathCoordinator.Instance.IsIntersection(node)) {
-                        //Debug.Log($"[{agentId}] Yielding at intersection {node.gridX},{node.gridY} due to predicted conflict");
-                        yield return new WaitForSeconds(1f);
-                        currentPath = PathCoordinator.Instance.RequestPath(agentId, transform.position, nextWayPoint);
-                        stepIndex = 0;
-                        continue;
+                // If this node represents a must "wait" action, just wait.
+                if( i > 0 && node == currentPath[i - 1]) {
+                    Debug.Log($"[{agentId}] is waiting at node {node.gridX},{node.gridY}");
+                    yield return new WaitForSeconds(1.0f / moveSpeed); // Wait for the duration of one step
+                } else {
+                    // move towards the node
+                    while (Vector3.Distance(transform.position, targetPos) > 0.5f) {
+                        Vector3 direction = (targetPos - transform.position).normalized;
+                        if (direction != Vector3.zero) {
+                            Quaternion targetRot = Quaternion.LookRotation(direction);
+                            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, rotationSpeed * Time.deltaTime);
+                        }
+                        transform.position = Vector3.MoveTowards(transform.position, targetPos, moveSpeed * time.deltaTime);
+                        yield return null;
                     }
+                    transform.position = targetPos;
                 }
-                */
-                if (PathCoordinator.Instance.IsIntersection(node) &&
-                    PathCoordinator.Instance.PredictConflict(agentId, currentPath)) {
-                    yield return new WaitForSeconds(1f); // Reroute in advance
-                    currentPath = PathCoordinator.Instance.RequestPath(agentId, transform.position, nextWayPoint);
-                    //if (currentPath == null || currentPath.Count == 0) yield break;
-                    stepIndex = 0;
-                    continue;
-                }
-
-                /*
-                if (!forcedStepMode && PathCoordinator.Instance.IsIntersection(node)) {
-                    if (PathCoordinator.Instance.PredictConflict(agentId, currentPath)) {
-                        yield return new WaitForSeconds(1f);
-                        currentPath = PathCoordinator.Instance.RequestPath(agentId, transform.position, nextWayPoint);
-                        stepIndex = 0;
-                        continue;
-                    }
-                }
-                */
-
-                PathCoordinator.Instance.NotifyEnterNode(agentId, node);
-                currentTarget = targetPos;
-
-                // Move towards the node
-                while (Vector3.Distance(transform.position, targetPos) > 0.05f) {
-                    Vector3 direction = (targetPos - transform.position).normalized;
-                    Quaternion targetRotation = Quaternion.LookRotation(direction);
-                    transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, rotationSpeed * Time.deltaTime);
-
-                    transform.position = Vector3.MoveTowards(transform.position, targetPos, moveSpeed * Time.deltaTime);
-                    yield return null;
-                }
-
-                transform.position = targetPos;
-                PathCoordinator.Instance.NotifyLeaveNode(agentId, node);
-                currentTarget = null;
-                stepIndex++;
+                stepIndex++; // crucial: advance the agent's internal timestep.
             }
+
+            Debug.Log($"[{agentId}] reached waypoint. Waiting...");
             yield return new WaitForSeconds(waitAtWaypoint);
+            currentPath.Clear();
         }
         moveCoroutine = null;
-        Debug.Log($"{name} reached all waypoints");
-        /*
-        if(path == null || path.Count == 0) {
-            Debug.LogWarning("No path found or empty");
-            yield break;
-        }
-        while (targetIndex < path.Count) {
-            Vector3 waypoint = path[targetIndex].worldPosition;
-            Vector3 targetPos = new Vector3(
-                waypoint.x,
-                transform.position.y,
-                waypoint.z
-            );
-            float dist = Vector3.Distance(transform.position, targetPos);
-            if(dist < .05f) {
-                transform.position = targetPos;
-                targetIndex++;
-                continue;
-            }
-            Vector3 direction = (targetPos - transform.position).normalized;
-            Quaternion targetRotation = Quaternion.LookRotation(direction);
-            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, rotationSpeed * Time.deltaTime);
-
-            float currentSpeed = (targetIndex < path.Count - 1 && IsTurning()) ? speed * 0.5f : speed;
-            transform.position = Vector3.MoveTowards(transform.position, targetPos, currentSpeed * Time.deltaTime);
-            yield return null;
-        }
-        */
-    /*
-    bool IsTurning() {
-        if(targetIndex < 1 || targetIndex >= path.Count - 1) return false;
-        Vector3 prev = path[targetIndex - 1].worldPosition;
-        Vector3 curr = path[targetIndex].worldPosition;
-        Vector3 next = path[targetIndex + 1].worldPosition;
-
-        Vector2 dir1 = new Vector2(curr.x - prev.x, curr.z - prev.z).normalized;
-        Vector2 dir2 = new Vector2(next.x - curr.x, next.z - curr.z).normalized;
-
-        return dir1 != dir2;
+        Debug.Log($"{name} has completed all waypoints");
     }
-    */
-    }
-    
-    public void ForceStep() {
-        //if(moveCoroutine != null) StopCoroutine(moveCoroutine);
-        //moveCoroutine = StartCoroutine(ForceStepCoroutine());
-        Debug.Log($"[{agentId}] Forced step triggered");
-    }
-    
-    private IEnumerator ForceStepCoroutine() {
-        Debug.Log($"[{agentId}] Forced step Cor");
-        if (currentPath == null || stepIndex >= currentPath.Count) yield break;
-        forcedStepMode = true;
-
-        Node node = currentPath[stepIndex];
-        Vector3 targetPos = new Vector3(node.worldPosition.x, transform.position.y, node.worldPosition.z);
-        PathCoordinator.Instance.NotifyEnterNode(agentId, node);
-        currentTarget = targetPos;
-
-        while (Vector3.Distance(transform.position, targetPos) > 0.05f) {
-            Vector3 direction = (targetPos - transform.position).normalized;
-            Quaternion targetRotation = Quaternion.LookRotation(direction);
-            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, rotationSpeed * Time.deltaTime);
-
-            transform.position = Vector3.MoveTowards(transform.position, targetPos, moveSpeed * Time.deltaTime);
-            yield return null;
-        }
-        transform.position = targetPos;
-        PathCoordinator.Instance.NotifyLeaveNode(agentId, node);
-        currentTarget = null;
-        stepIndex++;
-
-        forcedStepMode = false;
-
-        if (stepIndex < currentPath.Count) {
-            moveCoroutine = StartCoroutine(FollowWaypointsCoroutine());
-        }
-    }
-
     void OnDestroy() {
-        if (PathCoordinator.Instance) {
+        if (PathCoordinator.Instance != null) {
             PathCoordinator.Instance.UnregisterAgent(this);
         }
     }
-
-    public List<Node> GetCurrentPath() {
-        return currentPath;
-    }
-
-    public int GetStepIndex() {
-        return stepIndex;
-    }
-
-    public string GetAgentId() {
-        return agentId;
-    }
+    public int GetStepIndex() => stepIndex;
 }
