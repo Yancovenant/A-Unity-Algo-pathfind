@@ -56,19 +56,21 @@ public class MapGenerator : MonoBehaviour {
     public List<Vector3> spawnPoints = new List<Vector3>(); // Public exposed list for spawnpoints
     public List<Transform> warehouseTargets = new List<Transform>(); // Public exposed list for warehouse targets
 
-    void Start() {
+    public void GenerateMap() {
         // On start generate map
-        GenerateMap();
+        spawnPoints.Clear();
+        warehouseTargets.Clear();
+        GenerateMapInternal();
         mapSize = new Vector2Int(mapLayout[0].Length, mapLayout.Length);
         Debug.Log($"Map size: {mapSize}");
     }
-    void GenerateMap() {
+    void GenerateMapInternal() {
         // Foreach row
         for (int y = 0; y < mapLayout.Length; y++) {
             // foreach column
             var line = mapLayout[y];
             for (int x = 0; x < line.Length; x++) {
-                Vector3 pos = new Vector3(x + 0.5f, 0f, mapLayout.Length - y - 1 + .5f); // Flip y to z
+                Vector3 pos = new Vector3(x, 0f, mapLayout.Length - y - 1); // Flip y to z
                 char tile = line[x];
                 switch (tile) {
                     case 'R': // Road
