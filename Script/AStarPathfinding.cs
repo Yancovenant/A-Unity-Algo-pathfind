@@ -1,188 +1,444 @@
 /**
-* Pathfinding.cs
-* Handles the pathfinding system used by PathCoordinator.cs.
-* Using A* algorithm.
-* RESPECT reservation table.
+* PathCoordinator.cs
+* Central Coordination System for all AUGV Agents.
+* Handles: path planning, occupancy checking, dynamic re-routing, and collision prediction.
+* Global manager for all of the agents
 */
-
-/**
-/ -- (refactored for Cooperative A*)
-/*/
 
 using UnityEngine;
 using System.Collections.Generic;
+using System.Linq;
+using System.Collections;
 
-public class Pathfinding : MonoBehaviour {
-    void Awake() {}
-}
+// =======================================================================================================
+// Path Coordinator: The Central Brain of the Multi-Agent System
+// =======================================================================================================
 
-public static class AStarPathfinder {
-    // A helper class for the A* algo to keep track of nodes in the search space,
-    // which includes time.
-    private class PathNode {
-        public Node node;
-        public int timestep;
-        public int gCost; // Cost from start (eq to time);
-        public int hCost; // Heuristic cost to end
-        public PathNode parent;
+public class PathCoordinator : MonoBehaviour {
+    public static PathCoordinator Instance { get; private set; }
+    private GridManager grid;
 
-        public int fCost { get {return gCost + hCost;}}
+    private Dictionary<string, List<Node>> activePaths = new Dictionary<string, List<Node>>();
+    public AUGVAgent[] agents;
 
-        public PathNode(Node node, int timestep, int gCost, int hCost, PathNode parent) {
-            this.node = node;
-            this.timestep = timestep;
-            this.gCost = gCost;
-            this.hCost = hCost;
-            this.parent = parent;
+    IEnumerator Start() {
+        if (Instance != null && Instance != this) {
+            Destroy(gameObject);
+            yield break;
         }
+        Instance = this;
+
+        // Find dependencies
+        var mapGen = FindAnyObjectByType<MapGenerator>();
+        grid = FindAnyObjectByType<GridManager>();
+        var spawner = FindAnyObjectByType<AUGVSpawner>();
+        if (mapGen == null || grid == null || spawner == null) {
+            Debug.LogError("[PathCoordinator] Missing MapGenerator, GridManager, or AUGVSpawner.");
+            yield break;
+        }
+
+        // 1. Generate map
+        mapGen.GenerateMap();
+        yield return null; // Wait a frame for map to be generated
+
+        // 2. Create grid and spawn agents (can run in parallel)
+        grid.CreateGrid();
+        spawner.SpawnAgents();
+        yield return null; // Wait a frame for grid and agents
+
+        // 3. Assign node costs
+        GameObject[] allObjects = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None);
+        HashSet<Vector2Int> warehousePositions = new HashSet<Vector2Int>();
+        foreach (var obj in allObjects) {
+            if (obj.name.StartsWith("Warehouse_")) {
+                Vector3 pos = obj.transform.position;
+                Vector2Int nPos = new Vector2Int(Mathf.RoundToInt(pos.x), Mathf.RoundToInt(pos.z));
+                warehousePositions.Add(nPos);
+            }
+        }
+        for (int x = 0; x < grid.gridWorldSize.x; x++) {
+            for (int y = 0; y < grid.gridWorldSize.y; y++) {
+                Node node = grid.NodeFromWorldPoint(new Vector3(x, 0, y));
+                if (!node.walkable) continue;
+                Vector2Int nodePos = new Vector2Int(node.gridX, node.gridY);
+                node.cost = warehousePositions.Contains(nodePos) ? 2 : 1;
+            }
+        }
+        #if UNITY_EDITOR
+        UnityEditor.SceneView.RepaintAll();
+        #endif
+        // 4. Find agents for update loop
+        agents = FindObjectsByType<AUGVAgent>(FindObjectsSortMode.None);
     }
 
-    // A* Now will considers time and reservation table send by pathcoordinator.cs;
-    public static List<Node> FindPath(GridManager grid, Vector3 startPos, Vector3 targetPos, string agentId, int startTime, Dictionary<int, Dictionary<Node, string>> reservationTable) {
-        /**
-        * Alright so to summarize a* algorithm,
-        * we will compute it by checking the cost of the node,
-        * the cost is the sum of the gCost and hCost,
-        * gCost is the cost from the start node to the current node,
-        * hCost is the estimated cost from the current node to the target node,
-        * 
-        */
-        Node startNode = grid.NodeFromWorldPoint(startPos);
-        Node targetNode = grid.NodeFromWorldPoint(targetPos);
+    // Returns a path from startPos to endPos using A*
+    public List<Node> RequestPath(string agentId, Vector3 startPos, Vector3 endPos) {
+        if (grid == null) return null;
+        activePaths[agentId] = AStarPathfinder.FindPath(grid, startPos, endPos);
+        ResolveContestedNodes();
+        return activePaths[agentId];
+    }
 
-        List<PathNode> openSet = new List<PathNode>();
-        HashSet<Node> closedSet = new HashSet<Node>(); // still useful for pruning
-        Dictionary<(Node, int), PathNode> allNodes = new Dictionary<(Node, int), PathNode>();
+    void Update() {
+        foreach (var agent in agents) {
+            if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0) 
+                continue;
 
-        PathNode startPathNode = new PathNode(startNode, startTime, 0, GetDistance(startNode, targetNode), null);
-        openSet.Add(startPathNode);
-        allNodes.Add((startNode, startTime), startPathNode);
+            var agentPath = activePaths[agent.name];
+            var agentPos = agent.transform.position;
 
-        int maxTime = 100; //safety break to prevent infinite loops
+            // Find the closest node to the agent that's in their path
+            Node closestNode = null;
+            float closestDist = float.MaxValue;
+            int closestIndex = -1;
 
-        while (openSet.Count > 0) {
-            PathNode currentPathNode = openSet[0];
-            //Node currentNode = openSet[0];
-            /**
-            * First we will check the cost of the node,
-            * we could check it like this:
-            * 1. if the fCost is less that the fCost of the currentNode,
-            * 2. or if both fcost is equal and the hCost is less than the hCost of the currentNode,
-            * if so, we will set the currentNode to the node of this iteration,
-            */
-            for (int i = 1; i < openSet.Count; i++) {
-                if (openSet[i].fCost < currentPathNode.fCost ||
-                    (openSet[i].fCost == currentPathNode.fCost && openSet[i].hCost < currentPathNode.hCost)) {
-                    currentPathNode = openSet[i];
+            for (int i = 0; i < agentPath.Count; i++) {
+                var node = agentPath[i];
+                float dist = Vector3.Distance(
+                    new Vector3(node.worldPosition.x, agentPos.y, node.worldPosition.z),
+                    agentPos
+                );
+                if (dist < closestDist) {
+                    closestDist = dist;
+                    closestNode = node;
+                    closestIndex = i;
                 }
             }
-            /**
-            * Then we remove the currentNode from the openSet,
-            * and add it to the closedSet,
-            * if the currentNode is the targetNode, it means we have found the path,
-            * we will return the path,
-            */
-            openSet.Remove(currentPathNode);
 
-            if (currentPathNode.node == targetNode) {
-                // Retrace the path if path found.
-                // this is responsible for returning a path and breaking the loop
-                // only if the full path is found.
-                return RetracePath(currentPathNode);
+            // If agent is very close to a node (at its center), remove all previous nodes
+            if (closestDist < 0.1f && closestIndex > 0) {
+                activePaths[agent.name] = agentPath.GetRange(closestIndex, agentPath.Count - closestIndex);
             }
+        }
+    }
 
-            if (currentPathNode.timestep > maxTime) continue; // safetly call
+    /**
+    * Returns dictionary of current agent paths (for debug/gizmo)
+    */
+    public Dictionary<string, List<Node>> GetActivePaths() {
+        return activePaths;
+    }
+    /**
+    * Returns true if a neighbour node is an intersection
+    */
+    public bool IsIntersection(Node node) {
+        var neighbours = grid.GetNeighbours(node);
+        return neighbours.Count(n => n.walkable) > 2;
+    }
 
-            // -- we can now get neighbours AND wait in place ---
-            List<Node> neighbours = grid.GetNeighbours(currentPathNode.node);
-            neighbours.Add(currentPathNode.node); // add the current node it self
-            //closedSet.Add(currentNode);
-            /**
-            * then we check for the neighbour of the currentNode,
-            * if the neighbour is not walkable or already in closedSet, skip it.
-            * the newCostToNeighbour is the gCost CurrentNode + the distance between currentNode and neighbour,
-            * if newCostToNeighbour is less than the gCost of the neighbour,
-            * or if the neighbour is not in openSet,
-            * we can set the gCost, hCost, and parent of the neighbour,
-            * and add it to the openSet,
-            */
-            foreach (Node neighbourNode in neighbours) {
-                if (!neighbourNode.walkable) continue;
-                int newTimestep = currentPathNode.timestep + 1;
-
-                // -- Conflict check ---
-                // Is the neighbour node reserved by ANOTHER agent at the future timestep?
-                bool isReserved = false;
-                if (reservationTable.ContainsKey(newTimestep) && reservationTable[newTimestep].ContainsKey(neighbourNode)) {
-                    if(reservationTable[newTimestep][neighbourNode] != agentId) {
-                        isReserved = true;
+    
+    /*** ------ debugging gizmos ------ ***/
+    public Color[] agentColors;
+    void OnDrawGizmos() {
+        if (activePaths == null || grid == null || grid.grid == null) return;
+        // --- 1. Build contested node dictionary as before ---
+        Dictionary<string, List<(Node node, int cumulativeCost)>> agentCostPaths = new Dictionary<string, List<(Node, int)>>();
+        foreach (var kvp in activePaths) {
+            var path = kvp.Value;
+            if (path == null) continue;
+            List<(Node, int)> costPath = new List<(Node, int)>();
+            int costSum = 0;
+            foreach (var node in path) {
+                costSum += 1; // All nodes cost 1 for this logic
+                costPath.Add((node, costSum));
+            }
+            agentCostPaths[kvp.Key] = costPath;
+        }
+        Dictionary<(Node, int), List<string>> nodeCostToAgents = new Dictionary<(Node, int), List<string>>();
+        foreach (var kvp in agentCostPaths) {
+            string agentName = kvp.Key;
+            var costPath = kvp.Value;
+            foreach (var (node, cumCost) in costPath) {
+                var key = (node, cumCost);
+                if (!nodeCostToAgents.ContainsKey(key)) nodeCostToAgents[key] = new List<string>();
+                nodeCostToAgents[key].Add(agentName);
+            }
+        }
+        // --- 2. Compute occupied warehouse areas ---
+        HashSet<Node> occupiedNodes = new HashSet<Node>();
+        foreach (var agent in agents) {
+            if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0)
+                continue;
+            var path = activePaths[agent.name];
+            Node endNode = path[path.Count - 1];
+            // Check if endNode is a warehouse (by name in scene)
+            GameObject[] allObjs = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None);
+            bool isWarehouse = false;
+            foreach (var obj in allObjs) {
+                if (obj.name.StartsWith("Warehouse_")) {
+                    Vector3 pos = obj.transform.position;
+                    if (Mathf.RoundToInt(pos.x) == endNode.gridX && Mathf.RoundToInt(pos.z) == endNode.gridY) {
+                        isWarehouse = true;
+                        break;
                     }
                 }
-                // also check if we are swapping with another agent
-                if (reservationTable.ContainsKey(newTimestep) &&
-                    reservationTable[newTimestep].ContainsKey(currentPathNode.node) &&
-                    reservationTable.ContainsKey(currentPathNode.timestep) &&
-                    reservationTable[currentPathNode.timestep].ContainsKey(neighbourNode)) {
-                        if (reservationTable[newTimestep][currentPathNode.node] != agentId &&
-                            reservationTable[currentPathNode.timestep][neighbourNode] != agentId) {
-                                isReserved = true;
-                            }
-                    }
-                if (isReserved) continue; // path is blocked by reservation, cannot move here at this time.
-
-                int gCost = currentPathNode.gCost + 1; // Each Step cost 1 timestep;
-                int hCost = GetDistance(neighbourNode, targetNode);
-                var key = (neighbourNode, newTimestep);
-
-                if(allNodes.ContainsKey(key) && allNodes[key].gCost <= gCost) continue;
-                
-                PathNode neighbourPathNode = new PathNode(neighbourNode, newTimestep, gCost, hCost, currentPathNode);
-
-                if(!openSet.Contains(neighbourPathNode)) openSet.Add(neighbourPathNode); // could be improve with a PriorityQueue;
-                allNodes[key] = neighbourPathNode;
             }
-            /**
-            * This will keep going on and on until the openSet is empty,
-            * if there is no neighbour to check anymore,
-            * we then can stop the loop,
-            * but if the final path is found, it is automatically break the loop.
-            */
+            if (!isWarehouse) continue;
+            // Check if agent is inside 3x3 area centered on endNode
+            int cx = endNode.gridX, cy = endNode.gridY;
+            int ax = Mathf.RoundToInt(agent.transform.position.x);
+            int ay = Mathf.RoundToInt(agent.transform.position.z);
+            if (Mathf.Abs(ax - cx) <= 1 && Mathf.Abs(ay - cy) <= 1) {
+                // Mark all walkable nodes in 3x3 area as occupied
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dy = -1; dy <= 1; dy++) {
+                        int nx = cx + dx, ny = cy + dy;
+                        if (nx < 0 || ny < 0 || nx >= grid.grid.GetLength(0) || ny >= grid.grid.GetLength(1)) continue;
+                        Node n = grid.grid[nx, ny];
+                        if (n.walkable) occupiedNodes.Add(n);
+                    }
+                }
+            }
         }
-        /**
-        * If the openSet is empty, it means there is no path found,
-        * we will return null,
-        */
-        Debug.LogWarning("No path found between " + startPos + " and " + targetPos);
-        return null;
-    }
-    /**
-    * This method is used to retrace the path,
-    * it will start from the targetNode,
-    * and go back to the startNode,
-    * and add the node to the path,
-    */
-    private static List<Node> RetracePath(PathNode endPathNode) {
-        List<Node> path = new List<Node>();
-        PathNode currentPathNode = endPathNode;
-        while (currentPathNode != null) {
-            path.Add(currentPathNode.node);
-            currentPathNode = currentPathNode.parent;
+        // --- 3. Draw contested and occupied nodes ---
+        // Draw contested nodes (red)
+        HashSet<Node> drawnContested = new HashSet<Node>();
+        foreach (var kvp in agentCostPaths) {
+            string agentName = kvp.Key;
+            var costPath = kvp.Value;
+            int colorIndex = 0;
+            if (agentColors.Length > 0) {
+                if(agentName.StartsWith("AUGV_")) {
+                    if(int.TryParse(agentName.Substring(5), out int parsedIndex)) {
+                        colorIndex = parsedIndex % agentColors.Length;
+                    }
+                } else {
+                    int hash = 0;
+                    foreach (char c in agentName) hash +=c;
+                    colorIndex = hash % agentColors.Length;
+                }
+                Gizmos.color = agentColors[colorIndex];
+            } else {
+                Gizmos.color = Color.white;
+            }
+            for (int i = 0; i < costPath.Count; i++) {
+                var (node, cumCost) = costPath[i];
+                var key = (node, cumCost);
+                bool isContested = nodeCostToAgents[key].Count > 1;
+                Gizmos.color = isContested ? Color.red : (agentColors.Length > 0 ? agentColors[colorIndex] : Color.white);
+                Vector3 pos = node.worldPosition + new Vector3(0, .15f, 0);
+                Gizmos.DrawCube(pos, new Vector3(1, .1f, 1));
+            }
         }
-        path.Reverse();
-        return path;
+        // Draw occupied warehouse nodes (green, only if not already drawn as contested)
+        foreach (var node in occupiedNodes) {
+            if (drawnContested.Contains(node)) continue;
+            Gizmos.color = Color.green;
+            Vector3 pos = node.worldPosition + new Vector3(0, .18f, 0);
+            Gizmos.DrawCube(pos, new Vector3(1, .1f, 1));
+        }
     }
+
     /**
-    * This method is used to get the distance between two nodes,
-    * it will return the distance between the two nodes,
-    * the distance is the sum of the absolute difference of the x and y coordinates,
-    * if the absolute difference of the x and y coordinates is greater than the absolute difference of the y and x coordinates,
-    * we will return the distance as 14 * dstY + 10 * (dstX - dstY),
-    * otherwise we will return the distance as 14 * dstX + 10 * (dstY - dstX),
+    * So there is a problem where agent is stuck, roadblock, and no one is moving
+    * because they share the same path, see@predictConflict
+    * this calculate in the future index, where there is a node,
+    * that is being used by the other agent.
+    * more complex scenario could happen when the road width, length
+    * is similar to each like a mirror
+    * thus making the agent is not progressing at all.
+    * to solve this:
+    * 1. Global Reservation Table, for each node maintain reservation table
+    * that which agent will occupy it at which timestep.
+    * and when requesting a path, they would avoid this node;
+    * 2. Priority system deadlock, maintain agent in global, and when the deadlock is detected.
+    * we could allow the highest-priority agent to move.
+    * 3. wait actions, they would wait in the path for a timestep if the next node is reserved.
+    *
+    * Reference research Cooperative A\* (CA)
+    * - https://movingai.com/benchmarks/
+    * - https://en.wikipedia.org/wiki/Cooperative_A*
+    *
+    * Reference research WHCA (windowed hierarchical cooperative A)
+    * - https://www.aaai.org/Papers/AAAI/2004/AAAI04-072.pdf
     */
-    private static int GetDistance(Node a, Node b) {
-        int dstX = Mathf.Abs(a.gridX - b.gridX); //distance x -> absolute ax - bx
-        int dstY = Mathf.Abs(a.gridY - b.gridY); // distance y -> absolute ay - by
-        // if distance x > distance y
-        return (dstX > dstY) ? 14 * dstY + 10 * (dstX - dstY) : 14 * dstX + 10 * (dstY - dstX);
+
+    /**
+    * Too avaid all agents yielding, we needed to introduce a way,
+    * so that agent that has 'higher priority',
+    * will not yield, and only the rest is yielding and recalculating,
+    * we do this by path length or gCost + hCost,
+    * only the lower priority agents should yield.
+    */
+
+    // Helper: Find all intersections on a path before a given node
+    private List<Node> FindIntersectionsBeforeNode(List<Node> path, Node targetNode) {
+        var intersections = new List<Node>();
+        for (int i = 0; i < path.Count; i++) {
+            if (path[i] == targetNode) break;
+            if (IsIntersection(path[i])) intersections.Add(path[i]);
+        }
+        return intersections;
+    }
+
+    // Helper: Reroute from a given node to the goal, treating certain nodes as unwalkable
+    private List<Node> RerouteFromNode(Node from, Node goal, HashSet<Node> blockedNodes) {
+        // Temporarily mark blocked nodes as unwalkable
+        var originalWalkable = new Dictionary<Node, bool>();
+        foreach (var n in blockedNodes) {
+            originalWalkable[n] = n.walkable;
+            n.walkable = false;
+        }
+        var newPath = AStarPathfinder.FindPath(grid, from.worldPosition, goal.worldPosition);
+        // Restore walkable
+        foreach (var n in blockedNodes) n.walkable = originalWalkable[n];
+        return newPath;
+    }
+
+    // Main: Resolve contested nodes
+    public void ResolveContestedNodes() {
+        // 1. Build cost paths as in OnDrawGizmos
+        Dictionary<string, List<(Node node, int cumulativeCost)>> agentCostPaths = new Dictionary<string, List<(Node, int)>>();
+        foreach (var kvp in activePaths) {
+            var path = kvp.Value;
+            if (path == null) continue;
+            List<(Node, int)> costPath = new List<(Node, int)>();
+            int costSum = 0;
+            foreach (var node in path) {
+                costSum += 1;
+                costPath.Add((node, costSum));
+            }
+            agentCostPaths[kvp.Key] = costPath;
+        }
+        // 2. Find all contested nodes
+        Dictionary<(Node, int), List<string>> nodeCostToAgents = new Dictionary<(Node, int), List<string>>();
+        foreach (var kvp in agentCostPaths) {
+            string agentName = kvp.Key;
+            var costPath = kvp.Value;
+            foreach (var (node, cumCost) in costPath) {
+                var key = (node, cumCost);
+                if (!nodeCostToAgents.ContainsKey(key)) nodeCostToAgents[key] = new List<string>();
+                nodeCostToAgents[key].Add(agentName);
+            }
+        }
+        // 3. For each contested node (one at a time)
+        var contestedNodes = nodeCostToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
+        foreach (var contest in contestedNodes) {
+            Node contestedNode = contest.Key.Item1;
+            int contestCost = contest.Key.Item2;
+            var agentsInvolved = contest.Value;
+            // For each agent, find all intersections before the contested node
+            var agentIntersections = new Dictionary<string, List<Node>>();
+            var agentPaths = new Dictionary<string, List<Node>>();
+            foreach (var agentName in agentsInvolved) {
+                var path = activePaths[agentName];
+                agentPaths[agentName] = path;
+                agentIntersections[agentName] = FindIntersectionsBeforeNode(path, contestedNode);
+            }
+            // Build all scenarios: (a) all avoid, (b) each agent allowed
+            var scenarios = new List<Dictionary<string, List<Node>>>();
+            // (a) All avoid
+            var allAvoid = new Dictionary<string, List<Node>>();
+            foreach (var agentName in agentsInvolved) {
+                var intersections = agentIntersections[agentName];
+                if (intersections.Count == 0) continue; // No intersection before contested node
+                Node rerouteFrom = intersections.Last();
+                Node goal = agentPaths[agentName].Last();
+                var newPath = RerouteFromNode(rerouteFrom, goal, new HashSet<Node> { contestedNode });
+                if (newPath == null || newPath.Count == 0) goto skipAllAvoid;
+                // Build full path: up to rerouteFrom (inclusive), then newPath (excluding first node to avoid duplicate)
+                int idx = agentPaths[agentName].IndexOf(rerouteFrom);
+                var fullPath = agentPaths[agentName].Take(idx + 1).ToList();
+                fullPath.AddRange(newPath.Skip(1));
+                allAvoid[agentName] = fullPath;
+            }
+            scenarios.Add(allAvoid);
+            skipAllAvoid:;
+            // (b) Each agent allowed
+            foreach (var allowedAgent in agentsInvolved) {
+                var scenario = new Dictionary<string, List<Node>>();
+                foreach (var agentName in agentsInvolved) {
+                    var intersections = agentIntersections[agentName];
+                    if (intersections.Count == 0) goto skipScenario;
+                    Node rerouteFrom = intersections.Last();
+                    Node goal = agentPaths[agentName].Last();
+                    HashSet<Node> blocked = agentName == allowedAgent ? new HashSet<Node>() : new HashSet<Node> { contestedNode };
+                    var newPath = RerouteFromNode(rerouteFrom, goal, blocked);
+                    if (newPath == null || newPath.Count == 0) goto skipScenario;
+                    int idx = agentPaths[agentName].IndexOf(rerouteFrom);
+                    var fullPath = agentPaths[agentName].Take(idx + 1).ToList();
+                    fullPath.AddRange(newPath.Skip(1));
+                    scenario[agentName] = fullPath;
+                }
+                scenarios.Add(scenario);
+                skipScenario:;
+            }
+            // 4. Evaluate scenarios: only keep those where every agent has a valid path
+            scenarios = scenarios.Where(s => s.Count == agentsInvolved.Count).ToList();
+            if (scenarios.Count == 0) continue; // No valid scenario
+            // 5. Compute total cost for each scenario
+            int BestTotalCost = int.MaxValue;
+            Dictionary<string, List<Node>> bestScenario = null;
+            foreach (var scenario in scenarios) {
+                int totalCost = scenario.Values.Sum(path => path.Count);
+                if (totalCost < BestTotalCost) {
+                    BestTotalCost = totalCost;
+                    bestScenario = scenario;
+                }
+            }
+            // 6. Assign best scenario paths
+            if (bestScenario != null) {
+                foreach (var kvp in bestScenario) {
+                    activePaths[kvp.Key] = kvp.Value;
+                }
+            }
+        }
+
+        // After rerouting and before updating activePaths
+        foreach (var kvp in agentCostPaths)
+        {
+            string agentName = kvp.Key;
+            var costPath = kvp.Value;
+            Debug.Log($"[PathCoordinator] Agent {agentName} path:");
+            foreach (var (node, cumCost) in costPath)
+            {
+                Debug.Log($"  Node ({node.gridX},{node.gridY}) at cost {cumCost}");
+            }
+        }
+
+        // Log all contested nodes
+        foreach (var kvp in nodeCostToAgents)
+        {
+            if (kvp.Value.Count > 1)
+            {
+                var node = kvp.Key.Item1;
+                int cost = kvp.Key.Item2;
+                string agents = string.Join(", ", kvp.Value);
+                Debug.Log($"[PathCoordinator] Contested node ({node.gridX},{node.gridY}) at cost {cost} by agents: {agents}");
+            }
+        }
+
+        // Collect all unique cost values from all agent paths
+        var allPossibleCosts = new HashSet<int>();
+        foreach (var costPath in agentCostPaths.Values)
+        {
+            foreach (var (_, cumCost) in costPath)
+                allPossibleCosts.Add(cumCost);
+        }
+
+        // After cost path calculation, for each cost step
+        foreach (var cost in allPossibleCosts)
+        {
+            foreach (var agentA in agentCostPaths.Keys)
+            {
+                foreach (var agentB in agentCostPaths.Keys)
+                {
+                    if (agentA == agentB) continue;
+                    var pathA = agentCostPaths[agentA];
+                    var pathB = agentCostPaths[agentB];
+                    var stepA = pathA.FirstOrDefault(x => x.cumulativeCost == cost);
+                    var stepB = pathB.FirstOrDefault(x => x.cumulativeCost == cost);
+                    var prevA = pathA.FirstOrDefault(x => x.cumulativeCost == cost - 1);
+                    var prevB = pathB.FirstOrDefault(x => x.cumulativeCost == cost - 1);
+                    if (stepA.node != null && stepB.node != null && prevA.node != null && prevB.node != null)
+                    {
+                        if (stepA.node == prevB.node && stepB.node == prevA.node)
+                        {
+                            Debug.Log($"[PathCoordinator] Edge conflict at cost {cost}: {agentA} moves {prevA.node.gridX},{prevA.node.gridY} -> {stepA.node.gridX},{stepA.node.gridY}, {agentB} moves {prevB.node.gridX},{prevB.node.gridY} -> {stepB.node.gridX},{stepB.node.gridY}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
