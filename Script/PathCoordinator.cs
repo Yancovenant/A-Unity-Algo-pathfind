@@ -367,6 +367,16 @@ public class PathCoordinator : MonoBehaviour {
     * only the lower priority agents should yield.
     */
 
+    /**
+    * wow i am getting brain freeze at this moment. 24/6
+    * so i tried debuging all this below code.
+    * and the current code seems should be working right.
+    * and yes in the runtime, it get the best path without no conflict.
+    * but then in another runtime, it would reach maxdepth calculation and return a path with conflict.
+    * like hell.
+    * i call this The "Lucky algorithm".
+    */
+
     // Helper: Find all intersections on a path before a given node
     private List<Node> FindIntersectionsBeforeNode(List<Node> path, Node targetNode) {
         var intersections = new List<Node>();
@@ -429,7 +439,8 @@ public class PathCoordinator : MonoBehaviour {
         ResolveContestedNodesRecursive(0);
     }
 
-    private bool HasContestedNodes(Dictionary<string, List<Node>> paths) {
+    // New Helper: Finds all contested nodes and returns them as a list.
+    private List<KeyValuePair<(Node, int), List<string>>> GetContestedNodes(Dictionary<string, List<Node>> paths) {
         // Build cost paths
         Dictionary<string, List<(Node node, int cumulativeCost)>> agentCostPaths = new Dictionary<string, List<(Node, int)>>();
         foreach (var kvp in paths) {
@@ -444,7 +455,7 @@ public class PathCoordinator : MonoBehaviour {
             agentCostPaths[kvp.Key] = costPath;
         }
 
-        // Check for contested nodes
+        // Find all contested nodes
         Dictionary<(Node, int), List<string>> nodeCostToAgents = new Dictionary<(Node, int), List<string>>();
         foreach (var kvp in agentCostPaths) {
             string agentName = kvp.Key;
@@ -455,9 +466,47 @@ public class PathCoordinator : MonoBehaviour {
                 nodeCostToAgents[key].Add(agentName);
             }
         }
-
-        return nodeCostToAgents.Any(kvp => kvp.Value.Count > 1);
+        
+        // Return a list of all nodes where more than one agent is present at the same time-step
+        return nodeCostToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
     }
+
+    /***
+    /* CORE: IMPORTANT RESOLVEING THE PATH GIVEN BY A* IS HERE.
+    /* WE ARE THE SUPERVISOR THAT RESPONSIBLE FOR EVERY AGENT IN THE ENVIRONMENT.
+    /* TO SEND INSTRUCTION (PATH) TO EACH OF OUR AGENT. THAT IS THE BEST (USING A*).
+    /* AND ISNT CONFLICTING WITH THEIR PEERS.
+    /*
+    /*******************************************************************************
+    * TO SOLVE THIS, WE IMPLEMENT A COMBINATORIAL INCREASE LOGIC BASED SCENARIO BUILDING SYSTEM.
+    * EACH SCENARIO WOULD BE; (Let N be the number of AUGV'S involved in a conflict);
+    * CASE A => ALL AVOID; = 1 SCENARIO;
+    * CASE B => 1 OF AGENT IS ALLOWED THE REST IS NOT; = N SCENARIO'S;
+    * CASE C => NON-EMPTY SUBSETS OF AGENT IS 'WAIT' EXCEPT FULLSET.
+    * ========> A,B,C => NON-EMPTY SUBSET = {A}, {B}, {C}, {A,B}, {A,C}, {B,C}, {A,B,C}. <= EXCEPT THE FULL SET. 
+    * ========> 2^N - 2 SCENARIO's;
+    * ========> -----> Let k be the steps which the conflict occurs.
+    * ========> -----> FOR AUGV'S IN SUBSET {A} THE WAIT IS THE NUMBER OF POSSIBLE WAIT STEPS FROM 1 UP TO.
+    * ========> -----> (K-1)
+    * ========> -----> FOR MULTI-AGENT SUBSETS {A,B} THE WAIT TIME IS ALL PAIRS WHERE waitA ≠ waitB.
+    * ========> -----> Let m be size of Subset {a} -> m: 1, {a,b} m: 2;
+    * ========> -----> P(k,m) = k! / (k - m)!;
+    * ========> -----> together become n-1 n
+    * ========> ----->                  ∑ ( )⋅P(k,m)  SCENARIO'S;
+    * ========> ----->                 m=1 m
+    * ========> THE FORMULA TILL THIS POINT OF TIME IS :
+    * ========> 1 + N + THE ABOVE CODE, ITS HARD TO REPEAT IT.
+    * ========> EXAMPLES: 
+    * ========> FOR N = 3, K = 3;
+    * ========> SUBSETS: {A}, {B}, {C}, {A,B}, {A,C}, {B,C}
+    * ========> for m=1: 3 Subsets, each has 3 wait times = 9
+    * ========> for m=2: 3 subsets, each has P(3,2) = 6 assignments = 18
+    * ========> total wait scenarios is 9 + 18 = 27
+    * ========> plus 1 (all avoid) + 3 (each allowed) = 31 SCENARIO'S
+    *************************************************************************************
+    * WE COULD HOWEVER IN THE FUTURE, ADD MORE CASES, TO HELP OR COMPUTE THIS LOGIC BETTER,
+    * BASED ON RESEARCH DATA, RUNTIME, ETC.
+    /*/
 
     private void ResolveContestedNodesRecursive(int depth, int maxDepth = 10) {
         if (depth >= maxDepth) {
@@ -465,51 +514,37 @@ public class PathCoordinator : MonoBehaviour {
             return;
         }
 
-        // 1. Build cost paths as in OnDrawGizmos
-        Dictionary<string, List<(Node node, int cumulativeCost)>> agentCostPaths = new Dictionary<string, List<(Node, int)>>();
-        foreach (var kvp in activePaths) {
-            var path = kvp.Value;
-            if (path == null) continue;
-            List<(Node, int)> costPath = new List<(Node, int)>();
-            int costSum = 0;
-            foreach (var node in path) {
-                costSum += 1;
-                costPath.Add((node, costSum));
-            }
-            agentCostPaths[kvp.Key] = costPath;
+        // 1. Find all contested nodes in the current set of active paths.
+        // We sort them to ensure a deterministic order of resolution.
+        var contestedNodes = GetContestedNodes(activePaths)
+            .OrderBy(c => c.Key.Item2) // Order by cost (time)
+            //.ThenBy(c => c.Key.Item1.gridX) // Then by X
+            //.ThenBy(c => c.Key.Item1.gridY) // Then by Y
+            .ToList();
+
+        if (contestedNodes.Count == 0) {
+            Debug.Log($"[PathCoordinator] No conflicts found at depth {depth}. Resolution complete.");
+            return; // No more conflicts to resolve
         }
 
-        // 2. Find all contested nodes
-        Dictionary<(Node, int), List<string>> nodeCostToAgents = new Dictionary<(Node, int), List<string>>();
-        foreach (var kvp in agentCostPaths) {
-            string agentName = kvp.Key;
-            var costPath = kvp.Value;
-            foreach (var (node, cumCost) in costPath) {
-                var key = (node, cumCost);
-                if (!nodeCostToAgents.ContainsKey(key)) nodeCostToAgents[key] = new List<string>();
-                nodeCostToAgents[key].Add(agentName);
-            }
-        }
+        Debug.Log($"[PathCoordinator] Found {contestedNodes.Count} conflicts at depth {depth}. Planning resolutions...");
+        
+        var nextActivePaths = new Dictionary<string, List<Node>>(activePaths);
 
-        // 3. For each contested node (one at a time)
-        var contestedNodes = nodeCostToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
-        if (contestedNodes.Count == 0) return; // No more conflicts to resolve
-
+        // 2. For each contested node, find the best local resolution and plan to apply it.
+        // Do NOT apply it to activePaths or recurse yet.
         foreach (var contest in contestedNodes) {
             Node contestedNode = contest.Key.Item1;
-            int contestCost = contest.Key.Item2;
             var agentsInvolved = contest.Value;
 
-            Debug.Log($"[PathCoordinator] Resolving contested node at ({contestedNode.gridX}, {contestedNode.gridY}) at depth {depth} with agents: {string.Join(", ", agentsInvolved)}");
-
-            // For each agent, get their path
+            // Important: Get the LATEST paths for the agents involved from our 'nextActivePaths' state,
+            // as a previous resolution in this same loop might have already updated them.
             var agentPaths = new Dictionary<string, List<Node>>();
             foreach (var agentName in agentsInvolved) {
-                var path = activePaths[agentName];
-                agentPaths[agentName] = path;
+                agentPaths[agentName] = nextActivePaths[agentName];
             }
 
-            // Build all scenarios
+            // Build all scenarios for the current conflict
             var scenarios = new List<Dictionary<string, List<Node>>>();
 
             // (a) All avoid
@@ -517,102 +552,103 @@ public class PathCoordinator : MonoBehaviour {
             foreach (var agentName in agentsInvolved) {
                 var path = agentPaths[agentName];
                 if (path == null || path.Count == 0) continue;
-                Node rerouteFrom = path[0];
-                Node goal = path.Last();
-                var newPath = RerouteFromNode(rerouteFrom, goal, new HashSet<Node> { contestedNode });
-                if (newPath == null || newPath.Count == 0) goto skipAllAvoid;
-                allAvoid[agentName] = newPath;
+                var newPath = RerouteFromNode(path[0], path.Last(), new HashSet<Node> { contestedNode });
+                if (newPath != null && newPath.Count > 0) allAvoid[agentName] = newPath;
             }
-            scenarios.Add(allAvoid);
-            skipAllAvoid:;
+            if (allAvoid.Count == agentsInvolved.Count) scenarios.Add(allAvoid);
 
             // (b) Each agent allowed
             foreach (var allowedAgent in agentsInvolved) {
                 var scenario = new Dictionary<string, List<Node>>();
                 foreach (var agentName in agentsInvolved) {
                     var path = agentPaths[agentName];
-                    if (path == null || path.Count == 0) goto skipScenario;
-                    Node rerouteFrom = path[0];
-                    Node goal = path.Last();
+                    if (path == null || path.Count == 0) continue;
                     HashSet<Node> blocked = agentName == allowedAgent ? new HashSet<Node>() : new HashSet<Node> { contestedNode };
-                    var newPath = RerouteFromNode(rerouteFrom, goal, blocked);
-                    if (newPath == null || newPath.Count == 0) goto skipScenario;
-                    scenario[agentName] = newPath;
+                    var newPath = RerouteFromNode(path[0], path.Last(), blocked);
+                    if (newPath != null && newPath.Count > 0) scenario[agentName] = newPath;
                 }
-                scenarios.Add(scenario);
-                skipScenario:;
+                if (scenario.Count == agentsInvolved.Count) scenarios.Add(scenario);
             }
 
-            // (c) Each agent waits 1 step
-            foreach (var waitingAgent in agentsInvolved) {
-                var scenario = new Dictionary<string, List<Node>>();
-                foreach (var agentName in agentsInvolved) {
-                    var path = agentPaths[agentName];
-                    if (path == null || path.Count == 0) goto skipWaitScenario;
-                    if (agentName == waitingAgent) {
-                        // Duplicate the first node to simulate waiting
-                        var waitPath = new List<Node>(path.Count + 1);
-                        waitPath.Add(path[0]);
-                        waitPath.AddRange(path);
-                        scenario[agentName] = waitPath;
-                    } else {
+            // (c) Wait scenarios for all non-empty subsets except the full set
+            int k = contest.Key.Item2; // The step at which the conflict occurs
+            int agentCount = agentsInvolved.Count;
+            // Generate all non-empty, non-full subsets
+            var agentList = agentsInvolved.ToList();
+            for (int subsetMask = 1; subsetMask < (1 << agentCount) - 1; subsetMask++) {
+                // Build the subset
+                var subset = new List<int>();
+                for (int i = 0; i < agentCount; i++) {
+                    if (((subsetMask >> i) & 1) != 0) subset.Add(i);
+                }
+                int m = subset.Count;
+                if (m == 0 || m == agentCount) continue;
+                // For this subset, generate all unique permutations of wait times (from 1 to k) for the agents in the subset
+                var waitTimes = Enumerable.Range(1, k).ToArray();
+                foreach (var waitAssignment in GetPermutations(waitTimes, m)) {
+                    var scenario = new Dictionary<string, List<Node>>();
+                    // First, copy all agent paths
+                    for (int i = 0; i < agentCount; i++) {
+                        string agentName = agentList[i];
+                        var path = agentPaths[agentName];
+                        if (path == null || path.Count == 0) continue;
                         scenario[agentName] = new List<Node>(path);
                     }
+                    // Now, for each agent in the subset, insert the assigned number of waits
+                    for (int j = 0; j < m; j++) {
+                        int agentIdx = subset[j];
+                        string agentName = agentList[agentIdx];
+                        int waitSteps = waitAssignment[j];
+                        var path = scenario[agentName];
+                        if (path == null || path.Count == 0) continue;
+                        var waitPath = new List<Node>(path);
+                        for (int w = 0; w < waitSteps; w++) {
+                            waitPath.Insert(0, path[0]);
+                        }
+                        scenario[agentName] = waitPath;
+                    }
+                    if (scenario.Count == agentCount) scenarios.Add(scenario);
                 }
-                scenarios.Add(scenario);
-                skipWaitScenario:;
             }
 
-            // Export scenarios for debugging
+            if (scenarios.Count == 0) continue; // Could not generate any valid scenarios for this conflict
             ExportScenariosToJson(scenarios, contestedNode);
-
-            // 4. Evaluate scenarios and recursively check for conflicts
-            scenarios = scenarios.Where(s => s.Count == agentsInvolved.Count).ToList();
-            if (scenarios.Count == 0) continue;
-
+            // 3. Evaluate scenarios to find the best one for this specific conflict
             int bestTotalCost = int.MaxValue;
             Dictionary<string, List<Node>> bestScenario = null;
-
+            bool foundConflictFree = false;
+            
             foreach (var scenario in scenarios) {
-                // Create a temporary copy of activePaths with this scenario
-                var tempPaths = new Dictionary<string, List<Node>>(activePaths);
-                foreach (var kvp in scenario) {
-                    tempPaths[kvp.Key] = kvp.Value;
-                }
-
-                // Check if this scenario introduces new conflicts
-                bool hasNewConflicts = HasContestedNodes(tempPaths);
+                bool hasConflict = HasContestedNodes(scenario);
                 int totalCost = scenario.Values.Sum(path => path.Count);
-
-                // If this scenario has no conflicts or has a better cost than current best
-                if (!hasNewConflicts || totalCost < bestTotalCost) {
+                if (!hasConflict) {
+                    // If we find a conflict-free scenario, always prefer it
+                    if (!foundConflictFree || totalCost < bestTotalCost) {
+                        bestTotalCost = totalCost;
+                        bestScenario = scenario;
+                        foundConflictFree = true;
+                    }
+                } else if (!foundConflictFree && totalCost < bestTotalCost) {
+                    // Only consider conflicted scenarios if no conflict-free one has been found
                     bestTotalCost = totalCost;
                     bestScenario = scenario;
-
-                    // If no conflicts, we can use this scenario immediately
-                    if (!hasNewConflicts) {
-                        Debug.Log($"[PathCoordinator] Found conflict-free scenario at depth {depth}");
-                        break;
-                    }
                 }
             }
-
-            // 5. Apply best scenario and recursively resolve any new conflicts
+            
+            // 4. Apply the best local scenario to our temporary 'next' state.
             if (bestScenario != null) {
+                //Debug.Log($"Found best scenario for conflict at ({contestedNode.gridX}, {contestedNode.gridY}). Applying to planned state.");
                 foreach (var kvp in bestScenario) {
-                    activePaths[kvp.Key] = kvp.Value;
+                    nextActivePaths[kvp.Key] = kvp.Value;
                 }
-
-                // Recursively resolve any new conflicts
-                ResolveContestedNodesRecursive(depth + 1, maxDepth);
             }
         }
 
-        // Log final state
-        Debug.Log($"[PathCoordinator] Conflict resolution completed at depth {depth}");
-        foreach (var kvp in activePaths) {
-            Debug.Log($"[PathCoordinator] Final path for {kvp.Key}: {kvp.Value.Count} nodes");
-        }
+        // 5. AFTER planning all resolutions for this level, update the main activePaths.
+        activePaths = nextActivePaths;
+        
+        // 6. NOW, make a single recursive call to handle any new conflicts created by our changes.
+        ResolveContestedNodesRecursive(depth + 1, maxDepth);
     }
 
     public void NotifyPathComplete(string agentName) {
@@ -620,5 +656,29 @@ public class PathCoordinator : MonoBehaviour {
             activePaths.Remove(agentName);
             Debug.Log($"[PathCoordinator] Agent {agentName} completed their path. Removed from activePaths.");
         }
+    }
+
+    // Helper: Check if a scenario has any contested nodes
+    private bool HasContestedNodes(Dictionary<string, List<Node>> scenario) {
+        return GetContestedNodes(scenario).Count > 0;
+    }
+
+    // Helper: Generate all permutations of a given array, taken m at a time
+    private static IEnumerable<int[]> GetPermutations(int[] arr, int m) {
+        return Permute(arr, 0, m);
+    }
+    private static IEnumerable<int[]> Permute(int[] arr, int start, int m) {
+        if (start == m) {
+            yield return arr.Take(m).ToArray();
+        } else {
+            for (int i = start; i < arr.Length; i++) {
+                Swap(ref arr[start], ref arr[i]);
+                foreach (var perm in Permute(arr, start + 1, m)) yield return perm;
+                Swap(ref arr[start], ref arr[i]);
+            }
+        }
+    }
+    private static void Swap(ref int a, ref int b) {
+        int temp = a; a = b; b = temp;
     }
 }
