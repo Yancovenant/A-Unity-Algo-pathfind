@@ -9,6 +9,7 @@ using UnityEngine;
 using System.Collections.Generic;
 using System.Linq;
 using System.Collections;
+using System.IO;
 
 // =======================================================================================================
 // Path Coordinator: The Central Brain of the Multi-Agent System
@@ -20,6 +21,9 @@ public class PathCoordinator : MonoBehaviour {
 
     private Dictionary<string, List<Node>> activePaths = new Dictionary<string, List<Node>>();
     public AUGVAgent[] agents;
+
+    // New: Store waypoints for each agent
+    private Dictionary<string, Queue<Vector3>> agentWaypoints = new Dictionary<string, Queue<Vector3>>();
 
     IEnumerator Start() {
         if (Instance != null && Instance != this) {
@@ -79,7 +83,39 @@ public class PathCoordinator : MonoBehaviour {
         return activePaths[agentId];
     }
 
+    // New: Assign routes from JSON (called by RouteSocketServer)
+    public void AssignRoutesFromJSON(string json)
+    {
+        // Example JSON: { "AUGV_1": ["Warehouse_1", "Warehouse_2"], ... }
+        var parsed = MiniJSON.Json.Deserialize(json) as Dictionary<string, object>;
+        if (parsed == null) {
+            Debug.LogError("[PathCoordinator] Failed to parse route JSON");
+            return;
+        }
+        foreach (var kvp in parsed)
+        {
+            string agentName = kvp.Key;
+            var waypointNames = kvp.Value as List<object>;
+            if (waypointNames == null) continue;
+            var waypoints = new Queue<Vector3>();
+            foreach (var nameObj in waypointNames)
+            {
+                string targetName = nameObj.ToString();
+                GameObject targetObj = GameObject.Find(targetName);
+                if (targetObj == null)
+                {
+                    Debug.LogWarning($"[PathCoordinator] Target not found: {targetName}");
+                    continue;
+                }
+                waypoints.Enqueue(targetObj.transform.position);
+            }
+            agentWaypoints[agentName] = waypoints;
+        }
+        Debug.Log("[PathCoordinator] Assigned routes from JSON");
+    }
+
     void Update() {
+        // 1. Trim agent paths as before
         foreach (var agent in agents) {
             if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0) 
                 continue;
@@ -108,6 +144,56 @@ public class PathCoordinator : MonoBehaviour {
             // If agent is very close to a node (at its center), remove all previous nodes
             if (closestDist < 0.1f && closestIndex > 0) {
                 activePaths[agent.name] = agentPath.GetRange(closestIndex, agentPath.Count - closestIndex);
+            }
+        }
+
+        // 2. Assign new paths to idle agents
+        List<string> idleAgents = new List<string>();
+        foreach (var agent in agents) {
+            // Agent is idle if it has no path or finished its path
+            if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0) {
+                //Debug.Log($"agent {agent.name} is idle checking waypoint left");
+                // Only assign if there are waypoints left
+                if (agentWaypoints.ContainsKey(agent.name) && agentWaypoints[agent.name].Count > 0) {
+                    idleAgents.Add(agent.name);
+                }
+            } else {
+                Debug.Log($"agent {agent.name} is having activePaths {activePaths[agent.name]}, of {activePaths[agent.name].Count} left");
+            }
+        }
+        // If there are idle agents with waypoints, plan all their paths together
+        if (idleAgents.Count > 0) {
+            // Compute all new paths
+            Dictionary<string, List<Node>> newPaths = new Dictionary<string, List<Node>>();
+            foreach (var agentName in idleAgents) {
+                var agentObj = agents.FirstOrDefault(a => a.name == agentName);
+                if (agentObj == null) continue;
+                Vector3 startPos = agentObj.transform.position;
+                Vector3 endPos = agentWaypoints[agentName].Peek(); // Don't dequeue yet
+                var path = AStarPathfinder.FindPath(grid, startPos, endPos);
+                if (path != null && path.Count > 0) {
+                    newPaths[agentName] = path;
+                }
+            }
+            // Temporarily assign to activePaths for conflict resolution
+            foreach (var kvp in newPaths) {
+                activePaths[kvp.Key] = kvp.Value;
+            }
+            // Resolve conflicts
+            ResolveContestedNodes();
+            // After conflict resolution, assign the resolved path to the agent and dequeue the waypoint
+            foreach (var agentName in idleAgents) {
+                if (activePaths.ContainsKey(agentName) && activePaths[agentName] != null && activePaths[agentName].Count > 0) {
+                    // Dequeue the waypoint (now being processed)
+                    if (agentWaypoints.ContainsKey(agentName) && agentWaypoints[agentName].Count > 0) {
+                        agentWaypoints[agentName].Dequeue();
+                    }
+                    // Send the path to the agent (call a method on the agent to start moving)
+                    var agentObj = agents.FirstOrDefault(a => a.name == agentName);
+                    if (agentObj != null) {
+                        agentObj.SendMessage("FollowPath", activePaths[agentName], SendMessageOptions.DontRequireReceiver);
+                    }
+                }
             }
         }
     }
@@ -144,6 +230,7 @@ public class PathCoordinator : MonoBehaviour {
             }
             agentCostPaths[kvp.Key] = costPath;
         }
+
         Dictionary<(Node, int), List<string>> nodeCostToAgents = new Dictionary<(Node, int), List<string>>();
         foreach (var kvp in agentCostPaths) {
             string agentName = kvp.Key;
@@ -154,6 +241,7 @@ public class PathCoordinator : MonoBehaviour {
                 nodeCostToAgents[key].Add(agentName);
             }
         }
+        /** ====================================== **/
         // --- 2. Compute occupied warehouse areas ---
         HashSet<Node> occupiedNodes = new HashSet<Node>();
         foreach (var agent in agents) {
@@ -190,9 +278,11 @@ public class PathCoordinator : MonoBehaviour {
                 }
             }
         }
+        /** ======================================= **/
         // --- 3. Draw contested and occupied nodes ---
         // Draw contested nodes (red)
         HashSet<Node> drawnContested = new HashSet<Node>();
+        int agentIdx = 0;
         foreach (var kvp in agentCostPaths) {
             string agentName = kvp.Key;
             var costPath = kvp.Value;
@@ -211,6 +301,21 @@ public class PathCoordinator : MonoBehaviour {
             } else {
                 Gizmos.color = Color.white;
             }
+            foreach (var (node, cumCost) in costPath) {
+                var key = (node, cumCost);
+                bool isContested = nodeCostToAgents[key].Count > 1;
+                Gizmos.color = isContested ? Color.red : (agentColors.Length > 0 ? agentColors[colorIndex] : Color.white);
+                float xOffset = agentIdx * 0.20f;
+                //Vector3 pos = node.worldPosition + new Vector3(xOffset, .15f, 0);
+                Vector3 pos = node.worldPosition + new Vector3(0, .15f, 0);
+                Gizmos.DrawCube(pos, new Vector3(1f, .1f, 1));
+#if UNITY_EDITOR
+                //UnityEditor.Handles.Label(pos + Vector3.up * 0.5f, agentName);
+                //UnityEditor.Handles.Label(pos + Vector3.up * 0.3f, $"{cumCost}");
+#endif
+            }
+            agentIdx++;
+            /*
             for (int i = 0; i < costPath.Count; i++) {
                 var (node, cumCost) = costPath[i];
                 var key = (node, cumCost);
@@ -219,6 +324,7 @@ public class PathCoordinator : MonoBehaviour {
                 Vector3 pos = node.worldPosition + new Vector3(0, .15f, 0);
                 Gizmos.DrawCube(pos, new Vector3(1, .1f, 1));
             }
+            */
         }
         // Draw occupied warehouse nodes (green, only if not already drawn as contested)
         foreach (var node in occupiedNodes) {
@@ -285,6 +391,39 @@ public class PathCoordinator : MonoBehaviour {
         return newPath;
     }
 
+    // Helper: Export all scenarios to a JSON file for debugging
+    private void ExportScenariosToJson(List<Dictionary<string, List<Node>>> scenarios, Node contestedNode)
+    {
+        var exportList = new List<object>();
+        int scenarioIdx = 0;
+        foreach (var scenario in scenarios)
+        {
+            var scenarioObj = new Dictionary<string, object>();
+            scenarioObj["scenarioIndex"] = scenarioIdx;
+            var agentsList = new List<object>();
+            foreach (var kvp in scenario)
+            {
+                var agentObj = new Dictionary<string, object>();
+                agentObj["agentName"] = kvp.Key;
+                //agentObj["path"] = kvp.Value.Select(n => new { x = n.gridX, y = n.gridY }).ToList();
+                agentObj["path"] = kvp.Value.Select(n => new Dictionary<string, int> { { "x", n.gridX }, { "y", n.gridY } }).ToList();
+                agentsList.Add(agentObj);
+            }
+            scenarioObj["agents"] = agentsList;
+            exportList.Add(scenarioObj);
+            scenarioIdx++;
+        }
+        var exportObj = new Dictionary<string, object>
+        {
+            ["contestedNode"] = new Dictionary<string, int> { { "x", contestedNode.gridX }, {"y", contestedNode.gridY } },
+            ["scenarios"] = exportList
+        };
+        string json = MiniJSON.Json.Serialize(exportObj);
+        string filePath = System.IO.Path.Combine(Application.persistentDataPath, $"scenarios_contested_{contestedNode.gridX}_{contestedNode.gridY}.json");
+        System.IO.File.WriteAllText(filePath, json, System.Text.Encoding.UTF8);
+        Debug.Log($"[PathCoordinator] Exported scenarios to {filePath}");
+    }
+
     // Main: Resolve contested nodes
     public void ResolveContestedNodes() {
         // 1. Build cost paths as in OnDrawGizmos
@@ -311,36 +450,31 @@ public class PathCoordinator : MonoBehaviour {
                 nodeCostToAgents[key].Add(agentName);
             }
         }
+
         // 3. For each contested node (one at a time)
         var contestedNodes = nodeCostToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
         foreach (var contest in contestedNodes) {
             Node contestedNode = contest.Key.Item1;
             int contestCost = contest.Key.Item2;
             var agentsInvolved = contest.Value;
-            // For each agent, find all intersections before the contested node
-            var agentIntersections = new Dictionary<string, List<Node>>();
+            // For each agent, get their path
             var agentPaths = new Dictionary<string, List<Node>>();
             foreach (var agentName in agentsInvolved) {
                 var path = activePaths[agentName];
                 agentPaths[agentName] = path;
-                agentIntersections[agentName] = FindIntersectionsBeforeNode(path, contestedNode);
             }
-            // Build all scenarios: (a) all avoid, (b) each agent allowed
+            // Build all scenarios: (a) all avoid, (b) each agent allowed, (c) each agent waits 1 step
             var scenarios = new List<Dictionary<string, List<Node>>>();
             // (a) All avoid
             var allAvoid = new Dictionary<string, List<Node>>();
             foreach (var agentName in agentsInvolved) {
-                var intersections = agentIntersections[agentName];
-                if (intersections.Count == 0) continue; // No intersection before contested node
-                Node rerouteFrom = intersections.Last();
-                Node goal = agentPaths[agentName].Last();
+                var path = agentPaths[agentName];
+                if (path == null || path.Count == 0) continue;
+                Node rerouteFrom = path[0];
+                Node goal = path.Last();
                 var newPath = RerouteFromNode(rerouteFrom, goal, new HashSet<Node> { contestedNode });
                 if (newPath == null || newPath.Count == 0) goto skipAllAvoid;
-                // Build full path: up to rerouteFrom (inclusive), then newPath (excluding first node to avoid duplicate)
-                int idx = agentPaths[agentName].IndexOf(rerouteFrom);
-                var fullPath = agentPaths[agentName].Take(idx + 1).ToList();
-                fullPath.AddRange(newPath.Skip(1));
-                allAvoid[agentName] = fullPath;
+                allAvoid[agentName] = newPath;
             }
             scenarios.Add(allAvoid);
             skipAllAvoid:;
@@ -348,21 +482,39 @@ public class PathCoordinator : MonoBehaviour {
             foreach (var allowedAgent in agentsInvolved) {
                 var scenario = new Dictionary<string, List<Node>>();
                 foreach (var agentName in agentsInvolved) {
-                    var intersections = agentIntersections[agentName];
-                    if (intersections.Count == 0) goto skipScenario;
-                    Node rerouteFrom = intersections.Last();
-                    Node goal = agentPaths[agentName].Last();
+                    var path = agentPaths[agentName];
+                    if (path == null || path.Count == 0) goto skipScenario;
+                    Node rerouteFrom = path[0];
+                    Node goal = path.Last();
                     HashSet<Node> blocked = agentName == allowedAgent ? new HashSet<Node>() : new HashSet<Node> { contestedNode };
                     var newPath = RerouteFromNode(rerouteFrom, goal, blocked);
                     if (newPath == null || newPath.Count == 0) goto skipScenario;
-                    int idx = agentPaths[agentName].IndexOf(rerouteFrom);
-                    var fullPath = agentPaths[agentName].Take(idx + 1).ToList();
-                    fullPath.AddRange(newPath.Skip(1));
-                    scenario[agentName] = fullPath;
+                    scenario[agentName] = newPath;
                 }
                 scenarios.Add(scenario);
                 skipScenario:;
             }
+            // (c) Each agent waits 1 step at start
+            foreach (var waitingAgent in agentsInvolved) {
+                var scenario = new Dictionary<string, List<Node>>();
+                foreach (var agentName in agentsInvolved) {
+                    var path = agentPaths[agentName];
+                    if (path == null || path.Count == 0) goto skipWaitScenario;
+                    if (agentName == waitingAgent) {
+                        // Duplicate the first node to simulate waiting
+                        var waitPath = new List<Node>(path.Count + 1);
+                        waitPath.Add(path[0]);
+                        waitPath.AddRange(path);
+                        scenario[agentName] = waitPath;
+                    } else {
+                        scenario[agentName] = new List<Node>(path);
+                    }
+                }
+                scenarios.Add(scenario);
+                skipWaitScenario:;
+            }
+            // Export all scenarios for this contested node to JSON for debugging
+            ExportScenariosToJson(scenarios, contestedNode);
             // 4. Evaluate scenarios: only keep those where every agent has a valid path
             scenarios = scenarios.Where(s => s.Count == agentsInvolved.Count).ToList();
             if (scenarios.Count == 0) continue; // No valid scenario
@@ -439,6 +591,13 @@ public class PathCoordinator : MonoBehaviour {
                     }
                 }
             }
+        }
+    }
+
+    public void NotifyPathComplete(string agentName) {
+        if (activePaths.ContainsKey(agentName)) {
+            activePaths.Remove(agentName);
+            Debug.Log($"[PathCoordinator] Agent {agentName} completed their path. Removed from activePaths.");
         }
     }
 }
