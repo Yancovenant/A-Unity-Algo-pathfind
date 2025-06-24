@@ -10,12 +10,9 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using Newtonsoft.Json;
-using System.Collections.Generic;
 using System.Collections.Concurrent;
 
 public class RouteSocketServer : MonoBehaviour {
-    public RouteLoader routeLoader; // Assign in inspector
     public int port = 8051;
 
     private TcpListener listener;
@@ -32,11 +29,7 @@ public class RouteSocketServer : MonoBehaviour {
         // Handle incoming JSON strings from socket in Unity's main thread
         while (incomingRoutes.TryDequeue(out string json)) {
             Debug.Log("[RouteSocketServer] Received route JSON: " + json);
-            if (routeLoader != null) {
-                routeLoader.LoadFromJsonString(json);
-            } else {
-                Debug.LogWarning("RouteLoader not assigned.");
-            }
+            PathCoordinator.Instance.AssignRoutesFromJSON(json);
         }
     }
     void ListenForClients() {
