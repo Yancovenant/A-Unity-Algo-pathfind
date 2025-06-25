@@ -22,8 +22,16 @@ public class PathCoordinator : MonoBehaviour {
     private Dictionary<string, List<Node>> activePaths = new Dictionary<string, List<Node>>();
     public AUGVAgent[] agents;
 
-    // New: Store waypoints for each agent
     private Dictionary<string, Queue<Vector3>> agentWaypoints = new Dictionary<string, Queue<Vector3>>();
+
+    // New: Store Global track Index + Agent Index + Threshold delayed path.
+    private int globalStepIndex = 0;
+    private Dictionary<string, int> agentStepProgress = new Dictionary<string, int>(); // agentName -> steps moved (trim count)
+    private Dictionary<string, (List<Node> path, int waitUntilStep)> waitingAssignments = new Dictionary<string, (List<Node>, int)>();
+
+    // Lockstep: Track agent readiness
+    private HashSet<string> readyAgents = new HashSet<string>();
+    private bool lockstepInProgress = false;
 
     IEnumerator Start() {
         if (Instance != null && Instance != this) {
@@ -83,10 +91,70 @@ public class PathCoordinator : MonoBehaviour {
         return activePaths[agentId];
     }
 
-    // New: Assign routes from JSON (called by RouteSocketServer)
+    // Assign new paths to idle agents in lockstep
+    private void AssignNewPathsToIdleAgents() {
+        List<string> idleAgents = new List<string>();
+        foreach (var agent in agents) {
+            // Agent is idle if it has no path or finished its path
+            if ((activePaths == null || !activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0)
+                && agentWaypoints.ContainsKey(agent.name) && agentWaypoints[agent.name].Count > 0) {
+                idleAgents.Add(agent.name);
+            }
+        }
+        if (idleAgents.Count > 0) {
+            // Compute all new paths
+            Dictionary<string, List<Node>> newPaths = new Dictionary<string, List<Node>>();
+            foreach (var agentName in idleAgents) {
+                var agentObj = agents.FirstOrDefault(a => a.name == agentName);
+                if (agentObj == null) continue;
+                Vector3 startPos = agentObj.transform.position;
+                Vector3 endPos = agentWaypoints[agentName].Peek(); // Don't dequeue yet
+                var path = AStarPathfinder.FindPath(grid, startPos, endPos);
+                if (path != null && path.Count > 0) {
+                    newPaths[agentName] = path;
+                }
+            }
+            // Temporarily assign to activePaths for conflict resolution
+            foreach (var kvp in newPaths) {
+                activePaths[kvp.Key] = kvp.Value;
+            }
+            // Resolve conflicts
+            ResolveContestedNodes();
+            // After conflict resolution, assign the resolved path to the agent and dequeue the waypoint
+            foreach (var agentName in idleAgents) {
+                if (activePaths.ContainsKey(agentName) && activePaths[agentName] != null && activePaths[agentName].Count > 0) {
+                    var resolvedPath = activePaths[agentName];
+                    AssignPathToAgent(agentName, resolvedPath);
+                    // Dequeue the waypoint now since it's assigned
+                    if (agentWaypoints.ContainsKey(agentName) && agentWaypoints[agentName].Count > 0) {
+                        agentWaypoints[agentName].Dequeue();
+                    }
+                }
+            }
+        }
+    }
+
+    // Assign path to agent (in lockstep)
+    public void AssignPathToAgent(string agentName, List<Node> path) {
+        var agentObj = agents.FirstOrDefault(a => a.name == agentName);
+        if (agentObj != null) {
+            agentObj.SetPath(path);
+        }
+    }
+
+    // Overwrite NotifyPathComplete to trigger new path assignment in lockstep
+    public void NotifyPathComplete(string agentName) {
+        if (activePaths.ContainsKey(agentName)) {
+            activePaths.Remove(agentName);
+            Debug.Log($"[PathCoordinator] Agent {agentName} completed their path. Removed from activePaths.");
+        }
+        // After path complete, check if agent has more waypoints
+        AssignNewPathsToIdleAgents();
+    }
+
+    // Overwrite AssignRoutesFromJSON to use lockstep
     public void AssignRoutesFromJSON(string json)
     {
-        // Example JSON: { "AUGV_1": ["Warehouse_1", "Warehouse_2"], ... }
         var parsed = MiniJSON.Json.Deserialize(json) as Dictionary<string, object>;
         if (parsed == null) {
             Debug.LogError("[PathCoordinator] Failed to parse route JSON");
@@ -112,86 +180,61 @@ public class PathCoordinator : MonoBehaviour {
             agentWaypoints[agentName] = waypoints;
         }
         Debug.Log("[PathCoordinator] Assigned routes from JSON");
+        AssignNewPathsToIdleAgents();
+    }
+
+    // For real-time events (e.g., YOLO), stop all agents, replan, and resume in lockstep
+    public void HandleRealtimeEventAndReplan() {
+        StopAllAgentsImmediately();
+        // Replan for all agents (example: just re-assign current waypoints)
+        AssignNewPathsToIdleAgents();
     }
 
     void Update() {
-        // 1. Trim agent paths as before
-        foreach (var agent in agents) {
-            if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0) 
-                continue;
-
-            var agentPath = activePaths[agent.name];
-            var agentPos = agent.transform.position;
-
-            // Find the closest node to the agent that's in their path
-            Node closestNode = null;
-            float closestDist = float.MaxValue;
-            int closestIndex = -1;
-
-            for (int i = 0; i < agentPath.Count; i++) {
-                var node = agentPath[i];
-                float dist = Vector3.Distance(
-                    new Vector3(node.worldPosition.x, agentPos.y, node.worldPosition.z),
-                    agentPos
-                );
-                if (dist < closestDist) {
-                    closestDist = dist;
-                    closestNode = node;
-                    closestIndex = i;
+        // Assign new paths to idle agents if needed
+        AssignNewPathsToIdleAgents();
+        // Lockstep logic: Only agents in WaitingForStep or Moving state participate
+        var activeAgents = agents.Where(a => a.State == AUGVAgent.AgentState.WaitingForStep || a.State == AUGVAgent.AgentState.Moving).ToArray();
+        if (!lockstepInProgress) {
+            bool allAssigned = activeAgents.All(a => a.IsReadyForStep());
+            if (allAssigned && activeAgents.Length > 0) {
+                lockstepInProgress = true;
+                readyAgents.Clear();
+                foreach (var agent in activeAgents) {
+                    ReportAgentReady(agent.name);
                 }
-            }
-
-            // If agent is very close to a node (at its center), remove all previous nodes
-            if (closestDist < 0.1f && closestIndex > 0) {
-                activePaths[agent.name] = agentPath.GetRange(closestIndex, agentPath.Count - closestIndex);
             }
         }
-
-        // 2. Assign new paths to idle agents
-        List<string> idleAgents = new List<string>();
-        foreach (var agent in agents) {
-            // Agent is idle if it has no path or finished its path
-            if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0) {
-                //Debug.Log($"agent {agent.name} is idle checking waypoint left");
-                // Only assign if there are waypoints left
-                if (agentWaypoints.ContainsKey(agent.name) && agentWaypoints[agent.name].Count > 0) {
-                    idleAgents.Add(agent.name);
+        if (lockstepInProgress) {
+            if (readyAgents.Count == activeAgents.Length && activeAgents.Length > 0) {
+                globalStepIndex++;
+                Debug.Log($"[PathCoordinator] Lockstep: Advancing to global step {globalStepIndex}");
+                readyAgents.Clear();
+                foreach (var agent in activeAgents) {
+                    agent.AdvanceStep();
                 }
-            } else {
-                //Debug.Log($"agent {agent.name} is having activePaths {activePaths[agent.name]}, of {activePaths[agent.name].Count} left");
-            }
-        }
-        // If there are idle agents with waypoints, plan all their paths together
-        if (idleAgents.Count > 0) {
-            // Compute all new paths
-            Dictionary<string, List<Node>> newPaths = new Dictionary<string, List<Node>>();
-            foreach (var agentName in idleAgents) {
-                var agentObj = agents.FirstOrDefault(a => a.name == agentName);
-                if (agentObj == null) continue;
-                Vector3 startPos = agentObj.transform.position;
-                Vector3 endPos = agentWaypoints[agentName].Peek(); // Don't dequeue yet
-                var path = AStarPathfinder.FindPath(grid, startPos, endPos);
-                if (path != null && path.Count > 0) {
-                    newPaths[agentName] = path;
-                }
-            }
-            // Temporarily assign to activePaths for conflict resolution
-            foreach (var kvp in newPaths) {
-                activePaths[kvp.Key] = kvp.Value;
-            }
-            // Resolve conflicts
-            ResolveContestedNodes();
-            // After conflict resolution, assign the resolved path to the agent and dequeue the waypoint
-            foreach (var agentName in idleAgents) {
-                if (activePaths.ContainsKey(agentName) && activePaths[agentName] != null && activePaths[agentName].Count > 0) {
-                    // Dequeue the waypoint (now being processed)
-                    if (agentWaypoints.ContainsKey(agentName) && agentWaypoints[agentName].Count > 0) {
-                        agentWaypoints[agentName].Dequeue();
+                // After all agents have moved, trim their activePaths to reflect their current position
+                foreach (var agent in activeAgents) {
+                    if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0)
+                        continue;
+                    var agentPath = activePaths[agent.name];
+                    var agentPos = agent.transform.position;
+                    float closestDist = float.MaxValue;
+                    int closestIndex = -1;
+                    for (int i = 0; i < agentPath.Count; i++) {
+                        var node = agentPath[i];
+                        float dist = Vector3.Distance(
+                            new Vector3(node.worldPosition.x, agentPos.y, node.worldPosition.z),
+                            agentPos
+                        );
+                        if (dist < closestDist) {
+                            closestDist = dist;
+                            closestIndex = i;
+                        }
                     }
-                    // Send the path to the agent (call a method on the agent to start moving)
-                    var agentObj = agents.FirstOrDefault(a => a.name == agentName);
-                    if (agentObj != null) {
-                        agentObj.SendMessage("FollowPath", activePaths[agentName], SendMessageOptions.DontRequireReceiver);
+                    // If agent is very close to a node (at its center), remove all previous nodes (trimming)
+                    if (closestDist < 0.1f && closestIndex > 0) {
+                        activePaths[agent.name] = agentPath.GetRange(closestIndex, agentPath.Count - closestIndex);
                     }
                 }
             }
@@ -212,7 +255,6 @@ public class PathCoordinator : MonoBehaviour {
         return neighbours.Count(n => n.walkable) > 2;
     }
 
-    
     /*** ------ debugging gizmos ------ ***/
     public Color[] agentColors;
     void OnDrawGizmos() {
@@ -279,6 +321,7 @@ public class PathCoordinator : MonoBehaviour {
             }
         }
         /** ======================================= **/
+
         // --- 3. Draw contested and occupied nodes ---
         // Draw contested nodes (red)
         HashSet<Node> drawnContested = new HashSet<Node>();
@@ -305,6 +348,7 @@ public class PathCoordinator : MonoBehaviour {
                 var key = (node, cumCost);
                 bool isContested = nodeCostToAgents[key].Count > 1;
                 Gizmos.color = isContested ? Color.red : (agentColors.Length > 0 ? agentColors[colorIndex] : Color.white);
+                //Gizmos.color = agentColors.Length > 0 ? agentColors[colorIndex] : Color.white;
                 float xOffset = agentIdx * 0.20f;
                 //Vector3 pos = node.worldPosition + new Vector3(xOffset, .15f, 0);
                 Vector3 pos = node.worldPosition + new Vector3(0, .15f, 0);
@@ -315,16 +359,6 @@ public class PathCoordinator : MonoBehaviour {
 #endif
             }
             agentIdx++;
-            /*
-            for (int i = 0; i < costPath.Count; i++) {
-                var (node, cumCost) = costPath[i];
-                var key = (node, cumCost);
-                bool isContested = nodeCostToAgents[key].Count > 1;
-                Gizmos.color = isContested ? Color.red : (agentColors.Length > 0 ? agentColors[colorIndex] : Color.white);
-                Vector3 pos = node.worldPosition + new Vector3(0, .15f, 0);
-                Gizmos.DrawCube(pos, new Vector3(1, .1f, 1));
-            }
-            */
         }
         // Draw occupied warehouse nodes (green, only if not already drawn as contested)
         foreach (var node in occupiedNodes) {
@@ -609,7 +643,7 @@ public class PathCoordinator : MonoBehaviour {
         ResolveContestedNodesRecursive(depth + 1, maxDepth);
     }
 
-    public void NotifyPathComplete(string agentName) {
+    public void NotifyPathCompleteDeprecated(string agentName) {
         if (activePaths.ContainsKey(agentName)) {
             activePaths.Remove(agentName);
             Debug.Log($"[PathCoordinator] Agent {agentName} completed their path. Removed from activePaths.");
@@ -638,5 +672,40 @@ public class PathCoordinator : MonoBehaviour {
     }
     private static void Swap(ref int a, ref int b) {
         int temp = a; a = b; b = temp;
+    }
+
+    // Called by agents when ready for next step
+    public void ReportAgentReady(string agentName) {
+        readyAgents.Add(agentName);
+    }
+
+    // Stop all agents immediately (e.g., for real-time events)
+    public void StopAllAgentsImmediately() {
+        foreach (var agent in agents) {
+            agent.StopImmediately();
+        }
+        lockstepInProgress = false;
+        readyAgents.Clear();
+    }
+
+    // Returns true if agent has more waypoints
+    public bool HasWaypoints(string agentId) {
+        return agentWaypoints.ContainsKey(agentId) && agentWaypoints[agentId].Count > 0;
+    }
+    // Assigns the next path for agent if waypoints remain
+    public void AssignNextPathForAgent(string agentId) {
+        if (HasWaypoints(agentId)) {
+            var agentObj = agents.FirstOrDefault(a => a.name == agentId);
+            if (agentObj == null) return;
+            Vector3 startPos = agentObj.transform.position;
+            Vector3 endPos = agentWaypoints[agentId].Peek();
+            var path = AStarPathfinder.FindPath(grid, startPos, endPos);
+            if (path != null && path.Count > 0) {
+                activePaths[agentId] = path;
+                ResolveContestedNodes();
+                AssignPathToAgent(agentId, activePaths[agentId]);
+                agentWaypoints[agentId].Dequeue();
+            }
+        }
     }
 }
