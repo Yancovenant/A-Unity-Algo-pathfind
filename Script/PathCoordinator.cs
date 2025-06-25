@@ -335,48 +335,6 @@ public class PathCoordinator : MonoBehaviour {
         }
     }
 
-    /**
-    * So there is a problem where agent is stuck, roadblock, and no one is moving
-    * because they share the same path, see@predictConflict
-    * this calculate in the future index, where there is a node,
-    * that is being used by the other agent.
-    * more complex scenario could happen when the road width, length
-    * is similar to each like a mirror
-    * thus making the agent is not progressing at all.
-    * to solve this:
-    * 1. Global Reservation Table, for each node maintain reservation table
-    * that which agent will occupy it at which timestep.
-    * and when requesting a path, they would avoid this node;
-    * 2. Priority system deadlock, maintain agent in global, and when the deadlock is detected.
-    * we could allow the highest-priority agent to move.
-    * 3. wait actions, they would wait in the path for a timestep if the next node is reserved.
-    *
-    * Reference research Cooperative A\* (CA)
-    * - https://movingai.com/benchmarks/
-    * - https://en.wikipedia.org/wiki/Cooperative_A*
-    *
-    * Reference research WHCA (windowed hierarchical cooperative A)
-    * - https://www.aaai.org/Papers/AAAI/2004/AAAI04-072.pdf
-    */
-
-    /**
-    * Too avaid all agents yielding, we needed to introduce a way,
-    * so that agent that has 'higher priority',
-    * will not yield, and only the rest is yielding and recalculating,
-    * we do this by path length or gCost + hCost,
-    * only the lower priority agents should yield.
-    */
-
-    /**
-    * wow i am getting brain freeze at this moment. 24/6
-    * so i tried debuging all this below code.
-    * and the current code seems should be working right.
-    * and yes in the runtime, it get the best path without no conflict.
-    * but then in another runtime, it would reach maxdepth calculation and return a path with conflict.
-    * like hell.
-    * i call this The "Lucky algorithm".
-    */
-
     // Helper: Find all intersections on a path before a given node
     private List<Node> FindIntersectionsBeforeNode(List<Node> path, Node targetNode) {
         var intersections = new List<Node>();
