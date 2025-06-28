@@ -34,6 +34,8 @@ public class PathCoordinator : MonoBehaviour {
     private bool lockstepInProgress = false;
     private int globalStepIndex = 0;
 
+    private HashSet<Node> warehouseNodes = new HashSet<Node>();
+
 #if DEBUG_EXPORT
     private class AgentStepData {
         public string id;
@@ -85,6 +87,9 @@ public class PathCoordinator : MonoBehaviour {
         spawner.SpawnAgents();
         yield return null; // Wait a frame for grid and agents
 
+        // Cache warehouse nodes for performance
+        CacheWarehouseNodes();
+
         //AssignWarehouseCosts();
 
         // 5. Find agents / register the agent on environment.
@@ -110,6 +115,28 @@ public class PathCoordinator : MonoBehaviour {
                 if (!node.walkable) continue;
                 Vector2Int nodePos = new Vector2Int(node.gridX, node.gridY);
                 node.cost = warehousePositions.Contains(nodePos) ? 2 : 1;
+            }
+        }
+    }
+
+    // Helper to cache warehouse nodes (call after grid is created)
+    private void CacheWarehouseNodes() {
+        warehouseNodes.Clear();
+        GameObject[] allObjects = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None);
+        foreach (var obj in allObjects) {
+            if (obj.name.StartsWith("Warehouse_")) {
+                Vector3 pos = obj.transform.position;
+                int cx = Mathf.RoundToInt(pos.x);
+                int cy = Mathf.RoundToInt(pos.z);
+                // Mark all walkable nodes in 3x3 area as warehouse
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dy = -1; dy <= 1; dy++) {
+                        int nx = cx + dx, ny = cy + dy;
+                        if (nx < 0 || ny < 0 || nx >= grid.grid.GetLength(0) || ny >= grid.grid.GetLength(1)) continue;
+                        Node n = grid.grid[nx, ny];
+                        if (n.walkable) warehouseNodes.Add(n);
+                    }
+                }
             }
         }
     }
@@ -172,6 +199,8 @@ public class PathCoordinator : MonoBehaviour {
             .ToList();
         if (idleAgents.Count == 0) return;
 
+        var occupiedWarehouses = GetCurrentlyOccupiedWarehouseNodes();
+
         // Compute all new paths
         Dictionary<string, List<Node>> newPaths = new Dictionary<string, List<Node>>();
         foreach (var agentName in idleAgents) {
@@ -221,6 +250,11 @@ public class PathCoordinator : MonoBehaviour {
         var path = AStarPathfinder.FindPath(grid, startPos, endPos);
         if(path == null || path.Count == 0) return;
 
+        Node targetNode = grid.NodeFromWorldPoint(endPos);
+        var occupiedWarehouses = GetCurrentlyOccupiedWarehouseNodes();
+        bool isWarehouseTarget = warehouseNodes.Contains(targetNode);
+        bool warehouseOccupied = isWarehouseTarget && occupiedWarehouses.Contains(targetNode);
+        
         activePaths[agentId] = path;
         ResolveContestedNodes();
         /*
@@ -230,6 +264,7 @@ public class PathCoordinator : MonoBehaviour {
         */
         AssignPathToAgent(agentId, activePaths[agentId]);
         agentWaypoints[agentId].Dequeue();
+        
     }
 
     /**
@@ -269,7 +304,7 @@ public class PathCoordinator : MonoBehaviour {
     void Update() {
         // Assign new paths to idle agents if needed
         AssignNewPathsToIdleAgents();
-        ResolveContestedNodes();
+        //ResolveContestedNodes();
         // Lockstep logic: Only agents in WaitingForStep or Moving state participate
         var activeAgents = agents.Where(a => 
             a.State == AUGVAgent.AgentState.WaitingForStep || 
@@ -287,6 +322,7 @@ public class PathCoordinator : MonoBehaviour {
             readyAgents.Clear();
             //foreach (var agent in activeAgents) agent.ApplyPath(activePaths[agent.name]);
             //Debug.Log("ok");
+            ResolveContestedNodes();
             foreach (var agent in activeAgents) agent.AdvanceStep();
             //Debug.Log("after moving");
         }
@@ -434,7 +470,7 @@ public class PathCoordinator : MonoBehaviour {
     * WE COULD HOWEVER IN THE FUTURE, ADD MORE CASES, TO HELP OR COMPUTE THIS LOGIC BETTER,
     * BASED ON RESEARCH DATA, RUNTIME, ETC.
     /*/
-    private void ResolveContestedNodesRecursive(int depth, int maxDepth = 30) {
+    private void ResolveContestedNodesRecursive(int depth, int maxDepth = 10) {
 
         // Responsible to make sure a timeout exists so no excessive loop happening.
         // 10 tries for maximum.
@@ -463,7 +499,7 @@ public class PathCoordinator : MonoBehaviour {
         foreach (var contest in contestedNodes) {
             Node contestedNode = contest.Key.Item1;
             var agentsInvolved = contest.Value;
-
+            Debug.Log($"({contestedNode.gridX}, {contestedNode.gridY}) for agent, {agentsInvolved}");
             // Important: Get the LATEST paths for the agents involved from our 'nextActivePaths' state,
             // as a previous resolution in this same loop might have already updated them.
             var agentPaths = new Dictionary<string, List<Node>>();
@@ -597,8 +633,8 @@ public class PathCoordinator : MonoBehaviour {
     * thus extending this list, will be crucial step for the next bug fix.
     */
     private List<KeyValuePair<(Node, int), List<string>>> GetContestedNodes(Dictionary<string, List<Node>> paths) {
-        // Build cost paths
-        Dictionary<string, List<(Node node, int cumulativeCost)>> agentCostPaths = new Dictionary<string, List<(Node, int)>>();
+        // 1. Build cost paths for each agent
+        Dictionary<string, List<(Node node, int step)>> agentCostPaths = new Dictionary<string, List<(Node, int)>>();
         foreach (var kvp in paths) {
             var path = kvp.Value;
             if (path == null) continue;
@@ -611,44 +647,54 @@ public class PathCoordinator : MonoBehaviour {
             agentCostPaths[kvp.Key] = costPath;
         }
 
-        // Find all contested nodes
-        Dictionary<(Node, int), List<string>> nodeCostToAgents = new Dictionary<(Node, int), List<string>>();
+        // 2. Build mapping from (Node, step) to agents
+        Dictionary<(Node, int), List<string>> nodeStepToAgents = new Dictionary<(Node, int), List<string>>();
         foreach (var kvp in agentCostPaths) {
             string agentName = kvp.Key;
             var costPath = kvp.Value;
-            foreach (var (node, cumCost) in costPath) {
-                var key = (node, cumCost);
-                if (!nodeCostToAgents.ContainsKey(key)) nodeCostToAgents[key] = new List<string>();
-                nodeCostToAgents[key].Add(agentName);
+            foreach (var (node, step) in costPath) {
+                var key = (node, step);
+                if (!nodeStepToAgents.ContainsKey(key)) nodeStepToAgents[key] = new List<string>();
+                nodeStepToAgents[key].Add(agentName);
+                //Debug.Log(nodeStepToAgents[key]);
             }
         }
 
-        // Add swap conflict detection
+        // 3. Detect swap conflicts (edge collisions)
         var keys = agentCostPaths.Keys.ToArray();
         for (int i = 0; i < keys.Length; i++) {
             for (int j = i + 1; j < keys.Length; j++) {
                 var pathA = agentCostPaths[keys[i]];
                 var pathB = agentCostPaths[keys[j]];
-
                 for (int k = 1; k < pathA.Count && k < pathB.Count; k++) {
                     var (aPrev, aStepPrev) = pathA[k - 1];
                     var (aNow, aStepNow) = pathA[k];
                     var (bPrev, bStepPrev) = pathB[k - 1];
                     var (bNow, bStepNow) = pathB[k];
-
                     if (aNow == bPrev && bNow == aPrev && aStepNow == bStepNow) {
                         var swapKey = (aNow, aStepNow);
-                        if (!nodeCostToAgents.ContainsKey(swapKey))
-                            nodeCostToAgents[swapKey] = new List<string>();
-                        if (!nodeCostToAgents[swapKey].Contains(keys[i]))
-                            nodeCostToAgents[swapKey].Add(keys[i]);
-                        if (!nodeCostToAgents[swapKey].Contains(keys[j]))
-                            nodeCostToAgents[swapKey].Add(keys[j]);
+                        if (!nodeStepToAgents.ContainsKey(swapKey))
+                            nodeStepToAgents[swapKey] = new List<string>();
+                        if (!nodeStepToAgents[swapKey].Contains(keys[i]))
+                            nodeStepToAgents[swapKey].Add(keys[i]);
+                        if (!nodeStepToAgents[swapKey].Contains(keys[j]))
+                            nodeStepToAgents[swapKey].Add(keys[j]);
                     }
                 }
             }
         }
 
+        // 4. Add warehouse-occupied nodes as hard-blocked at a virtual step (e.g., step 9999)
+        /*
+        foreach (var node in warehouseNodes) {
+            var key = (node, 9999); // Use a high step index to avoid conflicts
+            if (!nodeStepToAgents.ContainsKey(key)) {
+                nodeStepToAgents[key] = new List<string>();
+            }
+            Debug.Log($"adding warehouse as occupied {node.gridX} {node.gridY}");
+            nodeStepToAgents[key].Add("WAREHOUSE_OCCUPIED");
+        }
+        */
         HashSet<Node> occupiedNodes = new HashSet<Node>();
         foreach (var agent in agents) {
             if (!activePaths.ContainsKey(agent.name) || activePaths[agent.name] == null || activePaths[agent.name].Count == 0)
@@ -656,6 +702,8 @@ public class PathCoordinator : MonoBehaviour {
             var path = activePaths[agent.name];
             Node endNode = path[path.Count - 1];
             // Check if endNode is a warehouse (by name in scene)
+            bool isWarehouse = warehouseNodes.Contains(endNode);
+            /*
             GameObject[] allObjs = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None);
             bool isWarehouse = false;
             foreach (var obj in allObjs) {
@@ -667,6 +715,7 @@ public class PathCoordinator : MonoBehaviour {
                     }
                 }
             }
+            */
             if (!isWarehouse) continue;
             // Check if agent is inside 3x3 area centered on endNode
             int cx = endNode.gridX, cy = endNode.gridY;
@@ -684,20 +733,20 @@ public class PathCoordinator : MonoBehaviour {
                 }
             }
         }
-
-        // Include warehouse-occupied nodes as hard-blocked at a virtual step (e.g., step 9999)
         foreach (var node in occupiedNodes) {
             var key = (node, 9999); // Use a high step index to avoid conflicts
-            if (!nodeCostToAgents.ContainsKey(key)) {
-                nodeCostToAgents[key] = new List<string>();
+            if (!nodeStepToAgents.ContainsKey(key)) {
+                nodeStepToAgents[key] = new List<string>();
             }
-            nodeCostToAgents[key].Add("WAREHOUSE_OCCUPIED");
+            //Debug.Log($"adding warehouse as occupied {node.gridX} {node.gridY}");
+            var ag = agentCostPaths.Where(a => a.Value.Item1 == node);
+            nodeStepToAgents[key].Add(ag.Key);
         }
-        
-        // Return a list of all nodes where more than one agent is present at the same time-step
-        return nodeCostToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
-    }
 
+        // 5. Return all nodes where more than one agent is present at the same time-step (including swap and warehouse)
+        return nodeStepToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
+    }
+    
     // Helper: Check if a scenario has any contested nodes
     private bool HasContestedNodes(Dictionary<string, List<Node>> scenario) {
         return GetContestedNodes(scenario).Count > 0;
@@ -742,62 +791,11 @@ public class PathCoordinator : MonoBehaviour {
         int temp = a; a = b; b = temp;
     }
 
-    /**
-    * Just a private helper, used for debugging scenarios to file json. that i could check.
-    */
-    private void ExportScenariosToJson(List<Dictionary<string, List<Node>>> scenarios, Node contestedNode) {
-        var exportList = new List<object>();
-        int scenarioIdx = 0;
-        foreach (var scenario in scenarios) {
-            var scenarioObj = new Dictionary<string, object>();
-            scenarioObj["scenarioIndex"] = scenarioIdx;
-            var agentsList = new List<object>();
-            foreach (var kvp in scenario) {
-                var agentObj = new Dictionary<string, object>();
-                agentObj["agentName"] = kvp.Key;
-                //agentObj["path"] = kvp.Value.Select(n => new { x = n.gridX, y = n.gridY }).ToList();
-                agentObj["path"] = kvp.Value.Select(n => new Dictionary<string, int> { { "x", n.gridX }, { "y", n.gridY } }).ToList();
-                agentsList.Add(agentObj);
-            }
-            scenarioObj["agents"] = agentsList;
-            exportList.Add(scenarioObj);
-            scenarioIdx++;
-        }
-        var exportObj = new Dictionary<string, object> {
-            ["contestedNode"] = new Dictionary<string, int> { { "x", contestedNode.gridX }, {"y", contestedNode.gridY } },
-            ["scenarios"] = exportList
-        };
-        string json = MiniJSON.Json.Serialize(exportObj);
-        string filePath = System.IO.Path.Combine(Application.persistentDataPath, $"scenarios_contested_{contestedNode.gridX}_{contestedNode.gridY}.json");
-        System.IO.File.WriteAllText(filePath, json, System.Text.Encoding.UTF8);
-        //Debug.Log($"[PathCoordinator] Exported scenarios to {filePath}");
-    }
-
-
-
-
-
-
-
     // For real-time events (e.g., YOLO), stop all agents, replan, and resume in lockstep
     public void HandleRealtimeEventAndReplan() {
         StopAllAgentsImmediately();
         // Replan for all agents (example: just re-assign current waypoints)
         AssignNewPathsToIdleAgents();
-    }
-
-    /**
-    * Returns dictionary of current agent paths (for debug/gizmo)
-    */
-    public Dictionary<string, List<Node>> GetActivePaths() {
-        return activePaths;
-    }
-    /**
-    * Returns true if a neighbour node is an intersection
-    */
-    public bool IsIntersection(Node node) {
-        var neighbours = grid.GetNeighbours(node);
-        return neighbours.Count(n => n.walkable) > 2;
     }
 
     /*** ------ debugging gizmos ------ ***/
@@ -953,56 +951,72 @@ public class PathCoordinator : MonoBehaviour {
         }
     }
 
-    // Helper: Find all intersections on a path before a given node
-    private List<Node> FindIntersectionsBeforeNode(List<Node> path, Node targetNode) {
-        var intersections = new List<Node>();
-        for (int i = 0; i < path.Count; i++) {
-            if (path[i] == targetNode) break;
-            if (IsIntersection(path[i])) intersections.Add(path[i]);
+    /**
+    * Just a private helper, used for debugging scenarios to file json. that i could check.
+    */
+    private void ExportScenariosToJson(List<Dictionary<string, List<Node>>> scenarios, Node contestedNode) {
+        var exportList = new List<object>();
+        int scenarioIdx = 0;
+        foreach (var scenario in scenarios) {
+            var scenarioObj = new Dictionary<string, object>();
+            scenarioObj["scenarioIndex"] = scenarioIdx;
+            var agentsList = new List<object>();
+            foreach (var kvp in scenario) {
+                var agentObj = new Dictionary<string, object>();
+                agentObj["agentName"] = kvp.Key;
+                //agentObj["path"] = kvp.Value.Select(n => new { x = n.gridX, y = n.gridY }).ToList();
+                agentObj["path"] = kvp.Value.Select(n => new Dictionary<string, int> { { "x", n.gridX }, { "y", n.gridY } }).ToList();
+                agentsList.Add(agentObj);
+            }
+            scenarioObj["agents"] = agentsList;
+            exportList.Add(scenarioObj);
+            scenarioIdx++;
         }
-        return intersections;
+        var exportObj = new Dictionary<string, object> {
+            ["contestedNode"] = new Dictionary<string, int> { { "x", contestedNode.gridX }, {"y", contestedNode.gridY } },
+            ["scenarios"] = exportList
+        };
+        string json = MiniJSON.Json.Serialize(exportObj);
+        string filePath = System.IO.Path.Combine(Application.persistentDataPath, $"scenarios_contested_{contestedNode.gridX}_{contestedNode.gridY}.json");
+        System.IO.File.WriteAllText(filePath, json, System.Text.Encoding.UTF8);
+        //Debug.Log($"[PathCoordinator] Exported scenarios to {filePath}");
     }
 
-    
-
-    
-
-    
-
-    
-
-    
-
-    public void NotifyPathCompleteDeprecated(string agentName) {
-        if (activePaths.ContainsKey(agentName)) {
-            activePaths.Remove(agentName);
-            Debug.Log($"[PathCoordinator] Agent {agentName} completed their path. Removed from activePaths.");
+    // Returns the set of currently occupied warehouse nodes (by agent positions)
+    public HashSet<Node> GetCurrentlyOccupiedWarehouseNodes() {
+        var occupied = new HashSet<Node>();
+        foreach (var agent in agents) {
+            // If agent is inside any warehouse node, mark it as occupied
+            Vector3 pos = agent.transform.position;
+            int ax = Mathf.RoundToInt(pos.x);
+            int ay = Mathf.RoundToInt(pos.z);
+            foreach (var node in warehouseNodes) {
+                if (Mathf.RoundToInt(node.worldPosition.x) == ax && Mathf.RoundToInt(node.worldPosition.z) == ay) {
+                    occupied.Add(node);
+                }
+            }
         }
+        return occupied;
     }
 
-    
+    // Helper: Get walkable adjacent nodes for a given node
+    private List<Node> GetAdjacentWalkableNodes(Node node) {
+        var adj = new List<Node>();
+        int[] dx = { -1, 1, 0, 0 };
+        int[] dy = { 0, 0, -1, 1 };
+        for (int d = 0; d < 4; d++) {
+            int nx = node.gridX + dx[d];
+            int ny = node.gridY + dy[d];
+            if (nx < 0 || ny < 0 || nx >= grid.grid.GetLength(0) || ny >= grid.grid.GetLength(1)) continue;
+            Node n = grid.grid[nx, ny];
+            if (n.walkable && !warehouseNodes.Contains(n)) adj.Add(n);
+        }
+        return adj;
+    }
 
-    
-
-    
-
-    
-
-    
-    
-
-
-
-    // i think this is deprecated.
-    // Returns a path from startPos to endPos using A*
-    public List<Node> RequestPath(string agentId, Vector3 startPos, Vector3 endPos) {
-        if (grid == null) return null;
-        activePaths[agentId] = AStarPathfinder.FindPath(grid, startPos, endPos);
-        ResolveContestedNodes();
-        return activePaths[agentId];
+    // Public method for agents to check if a warehouse node is free
+    public bool IsWarehouseNodeFree(Node warehouseNode) {
+        var occupied = GetCurrentlyOccupiedWarehouseNodes();
+        return !occupied.Contains(warehouseNode);
     }
 }
-
-
-
-    
