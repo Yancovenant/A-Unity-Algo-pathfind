@@ -12,18 +12,22 @@ using System.Text;
 using System.Threading;
 using System.Collections.Concurrent;
 
+
 public class RouteSocketServer : MonoBehaviour {
     public int port = 8051;
 
     private TcpListener listener;
-    private Thread socketThread;
+    private Thread serverThread;
 
     private ConcurrentQueue<string> incomingRoutes = new ConcurrentQueue<string>();
 
     void Start() {
-        socketThread = new Thread(ListenForClients);
-        socketThread.IsBackground = true;
-        socketThread.Start();
+        listener = new TcpListener(IPAddress.Any, 8051);
+        listener.Start();
+        serverThread = new Thread(HandleConnection);
+        serverThread.IsBackground = true;
+        serverThread.Start();
+        Debug.Log("[RouteSocketServer] Listening on port " + port);
     }
     void Update() {
         // Handle incoming JSON strings from socket in Unity's main thread
@@ -32,12 +36,8 @@ public class RouteSocketServer : MonoBehaviour {
             PathCoordinator.Instance.AssignRoutesFromJSON(json);
         }
     }
-    void ListenForClients() {
+    void HandleConnection() {
         try {
-            listener = new TcpListener(IPAddress.Any, port);
-            listener.Start();
-            Debug.Log("[RouteSocketServer] Listening on port " + port);
-
             while (true) {
                 using (TcpClient client = listener.AcceptTcpClient())
                 using (NetworkStream stream = client.GetStream()) {
@@ -47,6 +47,7 @@ public class RouteSocketServer : MonoBehaviour {
                     incomingRoutes.Enqueue(json);
                 }
             }
+            
         } catch (SocketException e) {
             Debug.LogError("[RouteSocketServer] Socket exception: " + e.Message);
         }
@@ -54,6 +55,6 @@ public class RouteSocketServer : MonoBehaviour {
 
     void OnApplicationQuit() {
         listener?.Stop();
-        socketThread?.Abort();
+        serverThread?.Abort();
     }
 }
