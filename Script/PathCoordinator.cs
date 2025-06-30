@@ -31,6 +31,9 @@ public class PathCoordinator : MonoBehaviour {
     private HashSet<string> activeAgents = new HashSet<string>();
     private bool lockstepInProgress = false;
     private int globalStepIndex = 0;
+    
+    private List<GameObject> warehouse;
+    public HashSet<Node> warehouseNodes = new HashSet<Node>();
 
     IEnumerator Start() {
         if (Instance != null && Instance != this) {
@@ -53,6 +56,14 @@ public class PathCoordinator : MonoBehaviour {
         grid.CreateGrid(); spawner.SpawnAgents(); yield return null;
 
         agents = FindObjectsByType<AUGVAgent>(FindObjectsSortMode.None);
+        /*
+        GameObject[] allObjects = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None);
+        foreach (var obj in allObjects) {
+            if (obj.name.StartsWith("Warehouse_")) warehouse.Add(obj);
+        }
+        */
+        warehouse = FindObjectsByType<GameObject>(FindObjectsSortMode.None)
+                        .Where(o => o.name.StartsWith("Warehouse_")).ToList();
     }
 
     /**
@@ -201,51 +212,95 @@ public class PathCoordinator : MonoBehaviour {
     * WE COULD HOWEVER IN THE FUTURE, ADD MORE CASES, TO HELP OR COMPUTE THIS LOGIC BETTER,
     * BASED ON RESEARCH DATA, RUNTIME, ETC.
     /*/
-    private void ResolveContestedNodesRecursive(int depth, int maxDepth = 30) {
+    private void ResolveContestedNodesRecursive(int depth, int maxDepth = 10) {
         if (depth >= maxDepth) {
             Debug.LogWarning("[PathCoordinator] Max recursion depth reached in conflict resolution");
             return;
         }
         var contestedNodes = GetContestedNodes(activePaths)
-            .OrderBy(c => c.Key.Item2).ToList();
+            .Select(kvp => (node: kvp.Key.Item1, step: kvp.Key.Item2, tags: kvp.Value))
+            .OrderBy(c => c.step).ToList();
+        
+        var nextActivePaths = new Dictionary<string, List<Node>>(activePaths);
+        
         if (contestedNodes.Count == 0) return;
 
         Debug.Log($"[PathCoordinator] Found {contestedNodes.Count} conflicts at depth {depth}. Planning resolutions...");
-        var nextActivePaths = new Dictionary<string, List<Node>>(activePaths);
-
+        
+        HashSet<Node> blockedNodes = warehouseNodes.Count > 0 ? new HashSet<Node>(warehouseNodes) : new HashSet<Node>();
         foreach (var contest in contestedNodes) {
-            var node = contest.Key.Item1;
-            var ags = contest.Value;
+            var node = contest.node;
+            var step = contest.step;
+            var tags = contest.tags;
+            var ags = tags.Keys.ToList();
             var paths = ags.ToDictionary(a => a, a => nextActivePaths[a]); // this is important in making sure to use the latest activepath from recursive solve path;
 
+            bool isWarehouseOnly = tags.All(kvp => kvp.Value.All(t => t == "Warehouse_Occupied"));
             var scenarios = new List<Dictionary<string, List<Node>>>();
+            
+            if (isWarehouseOnly) {
+                Debug.Log($"[WarehouseOnly] Handling warehouse conflict at ({node.gridX},{node.gridY})");
+                /*
+                foreach (var agentName in ags) {
+                    var path = paths[agentName];
+                    var goal = path[^1];
 
-            // (a) All avoid
-            var allAvoid = ags.ToDictionary(a => a, a => RerouteFromNode(paths[a][0], paths[a].Last(), new HashSet<Node> { node }));
-            if (allAvoid.Values.All(p => p != null && p.Count > 0)) scenarios.Add(allAvoid);
-
-            // (b) Each agent allowed
-            foreach (var allowed in ags) {
-                var s = ags.ToDictionary(a => a, a => RerouteFromNode(paths[a][0], paths[a].Last(),
-                    a == allowed ? new HashSet<Node>() : new HashSet<Node> { node }));
-                if (s.Values.All(p => p != null && p.Count > 0)) scenarios.Add(s);
-            }
-
-            // (c) Wait Permutations scenarios for all non-empty subsets except the full set
-            int k = contest.Key.Item2, n = ags.Count;
-            // Generate all non-empty, non-full subsets
-            var agentList = ags.ToList();
-            for (int mask = 1; mask < (1 << n) - 1; mask++) {
-                // Build the subset
-                var subset = Enumerable.Range(0, n).Where(i => (mask & (1 << i)) != 0).ToList();
-                // For this subset, generate all unique permutations of wait times (from 1 to k) for the agents in the subset
-                foreach (var waitCombo in GetPermutations(Enumerable.Range(1, k).ToArray(), subset.Count)) {
-                    var s = ags.ToDictionary(a => a, a => new List<Node>(paths[a]));
-                    for (int j = 0; j < subset.Count; j++) {
-                        var a = agentList[subset[j]];
-                        for (int w = 0; w < waitCombo[j]; w++) s[a].Insert(0, s[a][0]);
+                    // Find intersection before goal
+                    Node intersection = FindIntersectionsBeforeNode(path, goal);
+                    if (intersection == null) {
+                        Debug.LogWarning($"[WarehouseOnly] No intersection found for {agentName} before warehouse. Skipping delay logic.");
+                        continue;
                     }
-                    scenarios.Add(s);
+
+                    // Count steps to intersection
+                    int stopIndex = path.IndexOf(intersection);
+                    if (stopIndex < 0) continue;
+
+                    // Create a wait-at-intersection path
+                    List<Node> waitPath = new List<Node>();
+                    for (int i = 0; i <= stopIndex; i++) {
+                        waitPath.Add(path[i]);
+                    }
+
+                    // Simulate wait at that intersection (e.g., wait 3 steps)
+                    for (int w = 0; w < 3; w++) {
+                        waitPath.Insert(stopIndex, intersection);
+                    }
+                    // Add to modified path
+                    nextActivePaths[agentName] = waitPath;
+
+                    Debug.Log($"[WarehouseOnly] Agent {agentName} will wait at intersection ({intersection.gridX},{intersection.gridY})");
+                }
+                */
+                continue; // skip normal ABC logic
+            } else {
+                // (a) All avoid
+                var allAvoid = ags.ToDictionary(a => a, a => RerouteFromNode(paths[a][0], paths[a].Last(), new HashSet<Node> { node }));
+                if (allAvoid.Values.All(p => p != null && p.Count > 0)) scenarios.Add(allAvoid);
+
+                // (b) Each agent allowed
+                foreach (var allowed in ags) {
+                    var s = ags.ToDictionary(a => a, a => RerouteFromNode(paths[a][0], paths[a].Last(),
+                        a == allowed ? new HashSet<Node>() : new HashSet<Node> { node }));
+                    if (s.Values.All(p => p != null && p.Count > 0)) scenarios.Add(s);
+                }
+
+                // (c) Wait Permutations scenarios for all non-empty subsets except the full set
+                int k = contest.step, n = ags.Count;
+                // Generate all non-empty, non-full subsets
+                var agentList = ags.ToList();
+                for (int mask = 1; mask < (1 << n) - 1; mask++) {
+                    // Build the subset
+                    var subset = Enumerable.Range(0, n).Where(i => (mask & (1 << i)) != 0).ToList();
+                    // For this subset, generate all unique permutations of wait times (from 1 to k) for the agents in the subset
+                    foreach (var waitCombo in GetPermutations(Enumerable.Range(1, k).ToArray(), subset.Count)) {
+                        var s = ags.ToDictionary(a => a, a => new List<Node>(paths[a]));
+                        for (int j = 0; j < subset.Count; j++) {
+                            var a = agentList[subset[j]];
+                            for (int w = 0; w < waitCombo[j]; w++) s[a].Insert(0, s[a][0]);
+                        }
+                        scenarios.Add(s);
+                    }
                 }
             }
 
@@ -265,19 +320,28 @@ public class PathCoordinator : MonoBehaviour {
         ResolveContestedNodesRecursive(depth + 1, maxDepth);
     }
 
-    private List<KeyValuePair<(Node, int), List<string>>> GetContestedNodes(Dictionary<string, List<Node>> paths) {
+    private List<KeyValuePair<(Node, int), Dictionary<string, List<string>>>> GetContestedNodes(Dictionary<string, List<Node>> paths) {
         // Build cost paths
         var costPaths = paths.ToDictionary(
             kvp => kvp.Key,
             kvp => kvp.Value?.Select((n,i) => (n, i + 1)).ToList()
         );
         // Find all contested nodes
-        var nodeToAgents = new Dictionary<(Node, int), List<string>>();
+        var nodeToAgents = new Dictionary<(Node, int), Dictionary<string, List<string>>>();
         foreach (var kvp in costPaths) {
+            foreach (var (node, step) in kvp.Value) {
+                var key = (node, step);
+                if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary <string, List<string>>();
+                if (!nodeToAgents[key].ContainsKey(kvp.Key)) nodeToAgents[key][kvp.Key] = new List<string>();
+                nodeToAgents[key][kvp.Key].Add("Path");
+            }
+            /*
             kvp.Value?.ForEach(t => {
-                if (!nodeToAgents.ContainsKey(t)) nodeToAgents[t] = new List<string>();
+                if (!nodeToAgents.ContainsKey(t)) nodeToAgents[t] = new Dictionary<string, List<string>>();
                 nodeToAgents[t].AddIfMissing(kvp.Key);
+                nodeToAgents[t][kvp.Key]("Path");
             });
+            */
         }
         // Add swap conflict detection
         var keys = costPaths.Keys.ToArray();
@@ -288,14 +352,17 @@ public class PathCoordinator : MonoBehaviour {
                 for (int k = 1; k < Mathf.Min(a.Count, b.Count); k++) {
                     if (a[k].Item1 == b[k - 1].Item1 && b[k].Item1 == a[k - 1].Item1 && a[k].Item2 == b[k].Item2) {
                         var key = (a[k].Item1, a[k].Item2);
-                        if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new List<string>();
-                        nodeToAgents[key].AddIfMissing(keys[i], keys[j]);
+                        if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary<string, List<string>>();
+                        if (!nodeToAgents[key].ContainsKey(keys[i])) nodeToAgents[key][keys[i]] = new List<string>();
+                        if (!nodeToAgents[key].ContainsKey(keys[j])) nodeToAgents[key][keys[j]] = new List<string>();
+                        nodeToAgents[key][keys[i]].Add("Path");
+                        nodeToAgents[key][keys[j]].Add("Path");
                     }
                 }
             }
         }
         /*
-        var warehouseNodes = agents.SelectMany(agent => {
+        warehouseNodes = agents.SelectMany(agent => {
             var path = activePaths.GetValueOrDefault(agent.name);
             if (path == null || path.Count == 0) return Enumerable.Empty<Node>();
             var end = path[^1];
@@ -323,16 +390,75 @@ public class PathCoordinator : MonoBehaviour {
             nodeToAgents[key].AddIfMissing("WAREHOUSE_OCCUPIED");
         }
         */
+        var warehousePos = warehouse.Select(o => new Vector2Int(
+            Mathf.RoundToInt(o.transform.position.x),
+            Mathf.RoundToInt(o.transform.position.z))
+        ).ToHashSet();
+        var gridW = grid.grid.GetLength(0);
+        var gridH = grid.grid.GetLength(1);
+
+        foreach (var a in agents) {
+            if (!activePaths.TryGetValue(a.name, out var path) || path == null || path.Count == 0) continue;
+            var end = path[^1];
+            int cx = end.gridX, cy = end.gridY;
+            if (!warehousePos.Contains(new Vector2Int(cx, cy))) continue;
+            int ax = Mathf.RoundToInt(a.transform.position.x), ay = Mathf.RoundToInt(a.transform.position.z);
+            if (Mathf.Abs(ax - cx) > 1 || Mathf.Abs(ay - cy) > 1) continue;
+            /*
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    int nx = cx + dx, ny = cy + dy;
+                    if (nx < 0 || ny < 0 || nx >= grid.grid.GetLength(0) || ny >= grid.grid.GetLength(1)) continue;
+                    var n = grid.grid[nx, ny];
+                    if (!n.walkable) continue;
+
+                    var key = (n, 9999);
+                    if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary<string, List<string>>();
+                    if (!nodeToAgents[key].ContainsKey(a.name)) nodeToAgents[key][a.name] = new List<string>();
+                    nodeToAgents[key][a.name].Add("Warehouse_occupied");
+
+                    // Also add any other agents who plan to pass through this node
+                    foreach (var other in agents) {
+                        if (other.name == a.name) continue;
+                        var otherPath = activePaths.GetValueOrDefault(other.name);
+                        if (otherPath != null && otherPath.Contains(n)) {
+                            if (!nodeToAgents[key].ContainsKey(other.name)) nodeToAgents[key][other.name] = new List<string>();
+                            nodeToAgents[key][other.name].Add("Warehouse_occupied");
+                        }
+                    }
+                }
+            }
+            */
+            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
+                int nx = cx + dx, ny = cy + dy;
+                if ((uint)nx >= gridW || (uint)ny >= gridH) continue;
+                var n = grid.grid[nx, ny];
+                if (!n.walkable) continue;
+
+                var key = (n, 9999);
+                if (!nodeToAgents.TryGetValue(key, out var dict)) nodeToAgents[key] = dict = new();
+                if (!dict.TryGetValue(a.name, out var tagList)) dict[a.name] = tagList = new();
+                tagList.AddIfMissing("Warehouse_occupied");
+
+                foreach (var b in agents) {
+                    if (b.name == a.name) continue;
+                    if (activePaths.TryGetValue(b.name, out var op) && op != null && op.Contains(n)) {
+                        if (!dict.TryGetValue(b.name, out var tags)) dict[b.name] = tags = new();
+                        tags.AddIfMissing("Warehouse_occupied");
+                    }
+                }
+            }
+        }
+        /*
         foreach (var agent in agents) {
             var path = activePaths.GetValueOrDefault(agent.name);
             if (path == null || path.Count == 0) continue;
             
             var end = path[^1];
-            var warehouse = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None)
-                .Any(o => o.name.StartsWith("Warehouse_") &&
-                        Mathf.RoundToInt(o.transform.position.x) == end.gridX &&
-                        Mathf.RoundToInt(o.transform.position.z) == end.gridY);
-            if (!warehouse) continue;
+            var wh = warehouse
+                .Any(o => Mathf.RoundToInt(o.transform.position.x) == end.gridX &&
+                          Mathf.RoundToInt(o.transform.position.z) == end.gridY);
+            if (!wh) continue;
 
             int cx = end.gridX, cy = end.gridY;
             int ax = Mathf.RoundToInt(agent.transform.position.x), ay = Mathf.RoundToInt(agent.transform.position.z);
@@ -347,26 +473,59 @@ public class PathCoordinator : MonoBehaviour {
                     if (!n.walkable) continue;
 
                     var key = (n, 9999);
-                    if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new List<string>();
-                    if (!nodeToAgents[key].Contains(agent.name)) nodeToAgents[key].Add(agent.name);
+                    if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary<string, List<string>>();
+                    if (!nodeToAgents[key].ContainsKey(agent.name)) nodeToAgents[key][agent.name] = new List<string>();
+                    nodeToAgents[key][agent.name].Add("Warehouse_occupied");
 
                     // Also add any other agents who plan to pass through this node
                     foreach (var other in agents) {
                         if (other.name == agent.name) continue;
                         var otherPath = activePaths.GetValueOrDefault(other.name);
                         if (otherPath != null && otherPath.Contains(n)) {
-                            if (!nodeToAgents[key].Contains(other.name)) nodeToAgents[key].Add(other.name);
+                            if (!nodeToAgents[key].ContainsKey(other.name)) nodeToAgents[key][other.name] = new List<string>();
+                            nodeToAgents[key][other.name].Add("Warehouse_occupied");
                         }
                     }
                 }
             }
         }
+        */
+        
 
-        foreach (var n in nodeToAgents) Debug.Log($"node {n.Key.Item1.gridX} {n.Key.Item1.gridY} has {n.Value.Count}");
+        //foreach (var n in nodeToAgents) Debug.Log($"node {n.Key.Item1.gridX} {n.Key.Item1.gridY} has {n.Value.Count}");
         // Return a list of all nodes where more than one agent is present at the same time-step
         return nodeToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
     }
     
+    private void occupiedWarehouseNodes() {
+        // 1. Build set of occupied warehouse area nodes (3x3 around goal)
+        warehouseNodes.Clear(); // Clear global set
+        foreach (var a in agents) {
+            if (!activePaths.TryGetValue(a.name, out var path) || path == null || path.Count == 0) continue;
+            var end = path[^1];
+            var endVec = new Vector2Int(end.gridX, end.gridY);
+
+            // Fast check: is this end a warehouse?
+            bool isWarehouse = warehouse.Any(o =>
+                Mathf.RoundToInt(o.transform.position.x) == endVec.x &&
+                Mathf.RoundToInt(o.transform.position.z) == endVec.y
+            );
+            if (!isWarehouse) continue;
+
+            // Agent must be within 3x3 of that warehouse
+            int ax = Mathf.RoundToInt(a.transform.position.x);
+            int ay = Mathf.RoundToInt(a.transform.position.z);
+            if (Mathf.Abs(ax - endVec.x) > 1 || Mathf.Abs(ay - endVec.y) > 1) continue;
+
+            // Add 3x3 area nodes
+            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
+                int nx = endVec.x + dx, ny = endVec.y + dy;
+                if ((uint)nx >= grid.grid.GetLength(0) || (uint)ny >= grid.grid.GetLength(1)) continue;
+                var n = grid.grid[nx, ny];
+                if (n.walkable) warehouseNodes.Add(n);
+            }
+        }
+    }
 
     // Helper: Check if a scenario has any contested nodes
     private bool HasContestedNodes(Dictionary<string, List<Node>> scenario) =>
@@ -425,7 +584,23 @@ public class PathCoordinator : MonoBehaviour {
         );
     }
 
-    
+    /**
+    * Returns true if a neighbour node is an intersection
+    */
+    public bool IsIntersection(Node node) {
+        var neighbours = grid.GetNeighbours(node);
+        return neighbours.Count(n => n.walkable) > 2;
+    }
+
+    // Helper: Find all intersections on a path before a given nodeAdd commentMore actions
+    private Node FindIntersectionsBeforeNode(List<Node> path, Node targetNode) {
+        Node lastIntersection = null;
+        foreach (var node in path) {
+            if (node == targetNode) break;
+            if (IsIntersection(node)) lastIntersection = node;
+        }
+        return lastIntersection;
+    }
 
 
 
