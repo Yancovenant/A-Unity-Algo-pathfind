@@ -1,0 +1,4 @@
+werkzeug
+requests
+opencv-python
+ultralytics
