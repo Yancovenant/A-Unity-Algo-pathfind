@@ -2,11 +2,9 @@ from werkzeug.wrappers import Request, Response
 from werkzeug.routing import Map, Rule
 from werkzeug.serving import run_simple
 from .layout import render_layout
-import 
-
-
+ 
 def load_static_file(filename):
-    path = os.path.join(os.path.dirname(__file__), 'static', filename)
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'static', filename)
     if not os.path.exists(path):
         return Response('File not found', status=404)
     with open(path, 'rb') as f:
@@ -23,6 +21,7 @@ def create_app():
     def app(environ, start_response):
         request = Request(environ)
         adapter = url_map.bind_to_environ(environ)
+        print(adapter)
         try:
             endpoint, values = adapter.match()
             if endpoint == 'index':
