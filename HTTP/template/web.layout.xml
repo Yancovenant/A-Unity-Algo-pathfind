@@ -1,0 +1,15 @@
+<html>
+<head>
+    <title>AUGV Web Panel</title>
+    <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+    <header>
+        <h1>🧠 AUGV Dashboard</h1>
+    </header>
+    <main>
+        <t-placeholder></t-placeholder>
+    </main>
+    <script src="/static/index.js"></script>
+</body>
+</html>
