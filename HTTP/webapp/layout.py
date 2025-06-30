@@ -2,8 +2,8 @@ import os
 from xml.etree import ElementTree as ET
 
 def render_layout(content_file):
-    layout_path = os.path.join(os.path.dirname(__file__), 'templates', 'web.layout.xml')
-    content_path = os.path.join(os.path.dirname(__file__), 'templates', content_file)
+    layout_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'templates', 'web_layout.xml')
+    content_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'templates', content_file)
 
     layout = ET.parse(layout_path).getroot()
     content = ET.parse(content_path).getroot()
