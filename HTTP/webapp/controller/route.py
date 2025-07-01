@@ -1,15 +1,14 @@
 #webapp.controller.route.py
+# Updated to support WebSocket streaming from Unity instead of POST polling
 
 from werkzeug.wrappers import Response, Request
 from webapp.router import route
 from ..layout import render_layout
 from ..model.yolo_augv import agent_queues, agent_state, AgentYoloThread
 
-import json
-import os
-import time
-import traceback
-import numpy as np
+import json, os, time, traceback, threading, base64, numpy as np
+import asyncio
+import websockets
 
 IMAGE_SAVE_DIR = os.path.join(os.getcwd(), "debug_yolo_images")
 os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
@@ -84,3 +83,57 @@ def monitor_yolo_all(request: Request):
 
     html += "</body></html>"
     return Response(html, mimetype="text/html")
+
+connected_agents = {}
+
+def receive_image(agent_id: str, base64_img: str):
+    try:
+        if agent_id not in agent_queues:
+            AgentYoloThread(agent_id).start()
+
+        decoded = base64.b64decode(base64_img)
+        arr = np.frombuffer(decoded, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+        q = agent_queues[agent_id]
+        if not q.full():
+            q.put(img)
+    except Exception as e:
+        print(f"[receive_image error] {agent_id}: {e}")
+        traceback.print_exc()
+
+async def handle_ws(websocket):
+    try:
+        path = websocket.path
+        _, _, agent_id = path.strip("/").split("/")  # e.g. /ws/yolo/AUGV_1
+
+        print(f"[WebSocket] Agent {agent_id} connected")
+        AgentYoloThread(agent_id).start()
+        connected_agents[agent_id] = websocket
+
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                img_b64 = data.get("image")
+                if img_b64:
+                    receive_image(agent_id, img_b64)
+            except Exception as e:
+                print(f"[WebSocket error] {agent_id}: {e}")
+
+    except Exception as e:
+        print(f"[WebSocket Connection Error] {e}")
+
+    finally:
+        if agent_id in connected_agents:
+            del connected_agents[agent_id]
+        print(f"[WebSocket] Agent {agent_id} disconnected")
+
+async def start_ws_server():
+    print("[WebSocket] Starting on ws://localhost:9999/ws/yolo/<agent_id>")
+    async with websockets.serve(handle_ws, "localhost", 9999):
+        await asyncio.Future()  # run forever
+
+def start_ws_thread_once():
+    if not getattr(start_ws_thread_once, "started", False):
+        start_ws_thread_once.started = True
+        threading.Thread(target=lambda: asyncio.run(start_ws_server()), daemon=True).start()
