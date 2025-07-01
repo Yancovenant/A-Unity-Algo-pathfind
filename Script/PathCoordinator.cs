@@ -177,10 +177,18 @@ public class PathCoordinator : MonoBehaviour {
     * Yolo Setup is here
     */
     private void StartStreamingToYoloForAllAgents() {
+        /*
         foreach (var agent in agents) {
             Camera cam = agent.GetComponentInChildren<Camera>();
             if (cam == null) continue;
             StartCoroutine(StreamImageLoop(cam, agent.name));
+        }
+        */
+        foreach (var agent in agents) {
+            if (agent.GetComponentInChildren<CameraCaptureWebSocket>() != null) continue;
+
+            var streamer = agent.gameObject.AddComponent<CameraCaptureWebSocket>();
+            streamer.agentId = agent.name;
         }
     }
     private IEnumerator StreamImageLoop(Camera cam, string agentId) {
@@ -209,7 +217,8 @@ public class PathCoordinator : MonoBehaviour {
                     Debug.LogWarning($"[YOLO Stream] {agentId} upload error: {www.error}");
                 }
             }
-            yield return new WaitForSeconds(0.1f); // or lower if needed
+            yield return null;
+            //yield return new WaitForSeconds(0.01f); // or lower if needed
         }
     }
     private IEnumerator CheckAndAdvanceAgents() {
