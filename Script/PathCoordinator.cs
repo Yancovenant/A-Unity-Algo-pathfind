@@ -6,6 +6,8 @@
 */
 
 using UnityEngine;
+using UnityEngine.Networking;
+using UnityEngine.Rendering;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -15,6 +17,12 @@ using System.Text;
 // =======================================================================================================
 // Path Coordinator: The Central Brain of the Multi-Agent System
 // =======================================================================================================
+// NEW BEHAVIOR:
+// On simulation start, each agent will stream their camera feed to
+// its own YOLO stream route like: /api/yolo/stream/AUGV_1
+// Then every lockstep cycle, PathCoordinator will call a universal
+// check route: /api/yolo/check_all
+// to ask: "Is it safe for my agents to move?"
 
 public class PathCoordinator : MonoBehaviour {
     public static PathCoordinator Instance { get; private set; }
@@ -32,6 +40,8 @@ public class PathCoordinator : MonoBehaviour {
     private bool lockstepInProgress = false;
     private int globalStepIndex = 0;
 
+    private Dictionary<string, string> agentObstacleStates = new();
+    
     IEnumerator Start() {
         if (Instance != null && Instance != this) {
             Destroy(gameObject);
@@ -53,6 +63,7 @@ public class PathCoordinator : MonoBehaviour {
         grid.CreateGrid(); spawner.SpawnAgents(); yield return null;
 
         agents = FindObjectsByType<AUGVAgent>(FindObjectsSortMode.None);
+        StartStreamingToYoloForAllAgents();
     }
 
     /**
@@ -129,11 +140,13 @@ public class PathCoordinator : MonoBehaviour {
         if (lockstepInProgress && readyAgents.Length == activeAgents.Count && readyAgents.Length > 0) {
             globalStepIndex++;
             activeAgents.Clear();
+            
             ResolveContestedNodes();
+            StartCoroutine(CheckAndAdvanceAgents());
             foreach (var a in readyAgents) {
                 //CameraCaptureSocket capture = agent.GetComponentInChildren<CameraCaptureSocket>();
                 //capture?.CaptureAndSend();
-                a.Advance();
+                //a.Advance();
             }
         }
         TrimPathsToAgentPosition();
@@ -157,6 +170,70 @@ public class PathCoordinator : MonoBehaviour {
             }
             if (cDist < .1f && cIdx > 0) activePaths[agent.name] = path.GetRange(cIdx, path.Count - cIdx);
             if (path.Count == 0) activePaths[agent.name].Clear();
+        }
+    }
+
+    /**
+    * Yolo Setup is here
+    */
+    private void StartStreamingToYoloForAllAgents() {
+        foreach (var agent in agents) {
+            Camera cam = agent.GetComponentInChildren<Camera>();
+            if (cam == null) continue;
+            StartCoroutine(StreamImageLoop(cam, agent.name));
+        }
+    }
+    private IEnumerator StreamImageLoop(Camera cam, string agentId) {
+        int width = 160, height = 120;
+        RenderTexture rt = new RenderTexture(width, height, 24);
+        cam.targetTexture = rt;
+
+        while (true) {
+            cam.Render();
+            AsyncGPUReadbackRequest req = AsyncGPUReadback.Request(rt, 0, TextureFormat.RGB24);
+            yield return new WaitUntil(() => req.done);
+
+            if (!req.hasError) {
+                byte[] imageData = req.GetData<byte>().ToArray();
+
+                UnityWebRequest www = new UnityWebRequest($"http://localhost:8080/api/yolo/stream/{agentId}", "POST") {
+                    uploadHandler = new UploadHandlerRaw(imageData),
+                    downloadHandler = new DownloadHandlerBuffer()
+                };
+                www.SetRequestHeader("Content-Type", "application/octet-stream");
+                www.SetRequestHeader("Width", width.ToString());
+                www.SetRequestHeader("Height", height.ToString());
+
+                yield return www.SendWebRequest();
+                if (www.result != UnityWebRequest.Result.Success) {
+                    Debug.LogWarning($"[YOLO Stream] {agentId} upload error: {www.error}");
+                }
+            }
+            yield return new WaitForSeconds(0.1f); // or lower if needed
+        }
+    }
+    private IEnumerator CheckAndAdvanceAgents() {
+        UnityWebRequest www = UnityWebRequest.Get("http://localhost:8080/api/yolo/check_all");
+        yield return www.SendWebRequest();
+
+        if (www.result != UnityWebRequest.Result.Success) {
+            Debug.LogWarning("[YOLO CheckAll] failed: " + www.error);
+            yield break;
+        }
+
+        var json = www.downloadHandler.text;
+        var dict = MiniJSON.Json.Deserialize(json) as Dictionary<string, object>;
+        if (dict == null) yield break;
+
+        foreach (var agent in agents) {
+            if (dict.TryGetValue(agent.name, out var val) &&
+                val is Dictionary<string, object> state &&
+                state.TryGetValue("status", out var s) &&
+                s.ToString() == "safe") {
+                agent.Advance();
+            } else {
+                Debug.LogWarning($"[YOLO] {agent.name} is blocked by obstacle");
+            }
         }
     }
 
@@ -201,25 +278,31 @@ public class PathCoordinator : MonoBehaviour {
     * WE COULD HOWEVER IN THE FUTURE, ADD MORE CASES, TO HELP OR COMPUTE THIS LOGIC BETTER,
     * BASED ON RESEARCH DATA, RUNTIME, ETC.
     /*/
-    private void ResolveContestedNodesRecursive(int depth, int maxDepth = 30) {
+    private void ResolveContestedNodesRecursive(int depth, int maxDepth = 10) {
         if (depth >= maxDepth) {
             Debug.LogWarning("[PathCoordinator] Max recursion depth reached in conflict resolution");
             return;
         }
         var contestedNodes = GetContestedNodes(activePaths)
-            .OrderBy(c => c.Key.Item2).ToList();
+            .Select(kvp => (node: kvp.Key.Item1, step: kvp.Key.Item2, tags: kvp.Value))
+            .OrderBy(c => c.step).ToList();
+        
+        var nextActivePaths = new Dictionary<string, List<Node>>(activePaths);
+        
         if (contestedNodes.Count == 0) return;
 
         Debug.Log($"[PathCoordinator] Found {contestedNodes.Count} conflicts at depth {depth}. Planning resolutions...");
-        var nextActivePaths = new Dictionary<string, List<Node>>(activePaths);
-
+        
         foreach (var contest in contestedNodes) {
-            var node = contest.Key.Item1;
-            var ags = contest.Value;
+            var node = contest.node;
+            var step = contest.step;
+            var tags = contest.tags;
+            var ags = tags.Keys.ToList();
             var paths = ags.ToDictionary(a => a, a => nextActivePaths[a]); // this is important in making sure to use the latest activepath from recursive solve path;
 
+            bool isWarehouseOnly = tags.All(kvp => kvp.Value.All(t => t == "Warehouse_Occupied"));
             var scenarios = new List<Dictionary<string, List<Node>>>();
-
+            
             // (a) All avoid
             var allAvoid = ags.ToDictionary(a => a, a => RerouteFromNode(paths[a][0], paths[a].Last(), new HashSet<Node> { node }));
             if (allAvoid.Values.All(p => p != null && p.Count > 0)) scenarios.Add(allAvoid);
@@ -232,7 +315,7 @@ public class PathCoordinator : MonoBehaviour {
             }
 
             // (c) Wait Permutations scenarios for all non-empty subsets except the full set
-            int k = contest.Key.Item2, n = ags.Count;
+            int k = contest.step, n = ags.Count;
             // Generate all non-empty, non-full subsets
             var agentList = ags.ToList();
             for (int mask = 1; mask < (1 << n) - 1; mask++) {
@@ -265,19 +348,28 @@ public class PathCoordinator : MonoBehaviour {
         ResolveContestedNodesRecursive(depth + 1, maxDepth);
     }
 
-    private List<KeyValuePair<(Node, int), List<string>>> GetContestedNodes(Dictionary<string, List<Node>> paths) {
+    private List<KeyValuePair<(Node, int), Dictionary<string, List<string>>>> GetContestedNodes(Dictionary<string, List<Node>> paths) {
         // Build cost paths
         var costPaths = paths.ToDictionary(
             kvp => kvp.Key,
             kvp => kvp.Value?.Select((n,i) => (n, i + 1)).ToList()
         );
         // Find all contested nodes
-        var nodeToAgents = new Dictionary<(Node, int), List<string>>();
+        var nodeToAgents = new Dictionary<(Node, int), Dictionary<string, List<string>>>();
         foreach (var kvp in costPaths) {
+            foreach (var (node, step) in kvp.Value) {
+                var key = (node, step);
+                if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary <string, List<string>>();
+                if (!nodeToAgents[key].ContainsKey(kvp.Key)) nodeToAgents[key][kvp.Key] = new List<string>();
+                nodeToAgents[key][kvp.Key].Add("Path");
+            }
+            /*
             kvp.Value?.ForEach(t => {
-                if (!nodeToAgents.ContainsKey(t)) nodeToAgents[t] = new List<string>();
+                if (!nodeToAgents.ContainsKey(t)) nodeToAgents[t] = new Dictionary<string, List<string>>();
                 nodeToAgents[t].AddIfMissing(kvp.Key);
+                nodeToAgents[t][kvp.Key]("Path");
             });
+            */
         }
         // Add swap conflict detection
         var keys = costPaths.Keys.ToArray();
@@ -288,14 +380,17 @@ public class PathCoordinator : MonoBehaviour {
                 for (int k = 1; k < Mathf.Min(a.Count, b.Count); k++) {
                     if (a[k].Item1 == b[k - 1].Item1 && b[k].Item1 == a[k - 1].Item1 && a[k].Item2 == b[k].Item2) {
                         var key = (a[k].Item1, a[k].Item2);
-                        if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new List<string>();
-                        nodeToAgents[key].AddIfMissing(keys[i], keys[j]);
+                        if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary<string, List<string>>();
+                        if (!nodeToAgents[key].ContainsKey(keys[i])) nodeToAgents[key][keys[i]] = new List<string>();
+                        if (!nodeToAgents[key].ContainsKey(keys[j])) nodeToAgents[key][keys[j]] = new List<string>();
+                        nodeToAgents[key][keys[i]].Add("Path");
+                        nodeToAgents[key][keys[j]].Add("Path");
                     }
                 }
             }
         }
         /*
-        var warehouseNodes = agents.SelectMany(agent => {
+        warehouseNodes = agents.SelectMany(agent => {
             var path = activePaths.GetValueOrDefault(agent.name);
             if (path == null || path.Count == 0) return Enumerable.Empty<Node>();
             var end = path[^1];
@@ -323,16 +418,76 @@ public class PathCoordinator : MonoBehaviour {
             nodeToAgents[key].AddIfMissing("WAREHOUSE_OCCUPIED");
         }
         */
+        /*
+        var warehousePos = warehouse.Select(o => new Vector2Int(
+            Mathf.RoundToInt(o.transform.position.x),
+            Mathf.RoundToInt(o.transform.position.z))
+        ).ToHashSet();
+        var gridW = grid.grid.GetLength(0);
+        var gridH = grid.grid.GetLength(1);
+
+        foreach (var a in agents) {
+            if (!activePaths.TryGetValue(a.name, out var path) || path == null || path.Count == 0) continue;
+            var end = path[^1];
+            int cx = end.gridX, cy = end.gridY;
+            if (!warehousePos.Contains(new Vector2Int(cx, cy))) continue;
+            int ax = Mathf.RoundToInt(a.transform.position.x), ay = Mathf.RoundToInt(a.transform.position.z);
+            if (Mathf.Abs(ax - cx) > 1 || Mathf.Abs(ay - cy) > 1) continue;
+            /*
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    int nx = cx + dx, ny = cy + dy;
+                    if (nx < 0 || ny < 0 || nx >= grid.grid.GetLength(0) || ny >= grid.grid.GetLength(1)) continue;
+                    var n = grid.grid[nx, ny];
+                    if (!n.walkable) continue;
+
+                    var key = (n, 9999);
+                    if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary<string, List<string>>();
+                    if (!nodeToAgents[key].ContainsKey(a.name)) nodeToAgents[key][a.name] = new List<string>();
+                    nodeToAgents[key][a.name].Add("Warehouse_occupied");
+
+                    // Also add any other agents who plan to pass through this node
+                    foreach (var other in agents) {
+                        if (other.name == a.name) continue;
+                        var otherPath = activePaths.GetValueOrDefault(other.name);
+                        if (otherPath != null && otherPath.Contains(n)) {
+                            if (!nodeToAgents[key].ContainsKey(other.name)) nodeToAgents[key][other.name] = new List<string>();
+                            nodeToAgents[key][other.name].Add("Warehouse_occupied");
+                        }
+                    }
+                }
+            }
+            *
+            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) {
+                int nx = cx + dx, ny = cy + dy;
+                if ((uint)nx >= gridW || (uint)ny >= gridH) continue;
+                var n = grid.grid[nx, ny];
+                if (!n.walkable) continue;
+
+                var key = (n, 9999);
+                if (!nodeToAgents.TryGetValue(key, out var dict)) nodeToAgents[key] = dict = new();
+                if (!dict.TryGetValue(a.name, out var tagList)) dict[a.name] = tagList = new();
+                tagList.AddIfMissing("Warehouse_occupied");
+
+                foreach (var b in agents) {
+                    if (b.name == a.name) continue;
+                    if (activePaths.TryGetValue(b.name, out var op) && op != null && op.Contains(n)) {
+                        if (!dict.TryGetValue(b.name, out var tags)) dict[b.name] = tags = new();
+                        tags.AddIfMissing("Warehouse_occupied");
+                    }
+                }
+            }
+        }
+        /*
         foreach (var agent in agents) {
             var path = activePaths.GetValueOrDefault(agent.name);
             if (path == null || path.Count == 0) continue;
             
             var end = path[^1];
-            var warehouse = GameObject.FindObjectsByType<GameObject>(FindObjectsSortMode.None)
-                .Any(o => o.name.StartsWith("Warehouse_") &&
-                        Mathf.RoundToInt(o.transform.position.x) == end.gridX &&
-                        Mathf.RoundToInt(o.transform.position.z) == end.gridY);
-            if (!warehouse) continue;
+            var wh = warehouse
+                .Any(o => Mathf.RoundToInt(o.transform.position.x) == end.gridX &&
+                          Mathf.RoundToInt(o.transform.position.z) == end.gridY);
+            if (!wh) continue;
 
             int cx = end.gridX, cy = end.gridY;
             int ax = Mathf.RoundToInt(agent.transform.position.x), ay = Mathf.RoundToInt(agent.transform.position.z);
@@ -347,26 +502,29 @@ public class PathCoordinator : MonoBehaviour {
                     if (!n.walkable) continue;
 
                     var key = (n, 9999);
-                    if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new List<string>();
-                    if (!nodeToAgents[key].Contains(agent.name)) nodeToAgents[key].Add(agent.name);
+                    if (!nodeToAgents.ContainsKey(key)) nodeToAgents[key] = new Dictionary<string, List<string>>();
+                    if (!nodeToAgents[key].ContainsKey(agent.name)) nodeToAgents[key][agent.name] = new List<string>();
+                    nodeToAgents[key][agent.name].Add("Warehouse_occupied");
 
                     // Also add any other agents who plan to pass through this node
                     foreach (var other in agents) {
                         if (other.name == agent.name) continue;
                         var otherPath = activePaths.GetValueOrDefault(other.name);
                         if (otherPath != null && otherPath.Contains(n)) {
-                            if (!nodeToAgents[key].Contains(other.name)) nodeToAgents[key].Add(other.name);
+                            if (!nodeToAgents[key].ContainsKey(other.name)) nodeToAgents[key][other.name] = new List<string>();
+                            nodeToAgents[key][other.name].Add("Warehouse_occupied");
                         }
                     }
                 }
             }
         }
+        */
+        
 
-        foreach (var n in nodeToAgents) Debug.Log($"node {n.Key.Item1.gridX} {n.Key.Item1.gridY} has {n.Value.Count}");
+        //foreach (var n in nodeToAgents) Debug.Log($"node {n.Key.Item1.gridX} {n.Key.Item1.gridY} has {n.Value.Count}");
         // Return a list of all nodes where more than one agent is present at the same time-step
         return nodeToAgents.Where(kvp => kvp.Value.Count > 1).ToList();
     }
-    
 
     // Helper: Check if a scenario has any contested nodes
     private bool HasContestedNodes(Dictionary<string, List<Node>> scenario) =>
@@ -425,7 +583,23 @@ public class PathCoordinator : MonoBehaviour {
         );
     }
 
-    
+    /**
+    * Returns true if a neighbour node is an intersection
+    */
+    public bool IsIntersection(Node node) {
+        var neighbours = grid.GetNeighbours(node);
+        return neighbours.Count(n => n.walkable) > 2;
+    }
+
+    // Helper: Find all intersections on a path before a given nodeAdd commentMore actions
+    private Node FindIntersectionsBeforeNode(List<Node> path, Node targetNode) {
+        Node lastIntersection = null;
+        foreach (var node in path) {
+            if (node == targetNode) break;
+            if (IsIntersection(node)) lastIntersection = node;
+        }
+        return lastIntersection;
+    }
 
 
 
