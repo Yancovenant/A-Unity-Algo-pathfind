@@ -1,6 +1,6 @@
 # Automated-Guided-Vehicles-AUGV-AStar-Navigating
 
-//pip install ultralytics opencv-python
+`pip install ultralytics opencv-python`
 
 ```
 Unity                Python (Flask/WebSocket)
