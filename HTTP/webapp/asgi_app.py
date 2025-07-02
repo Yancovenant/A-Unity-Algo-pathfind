@@ -12,6 +12,11 @@ from starlette.requests import Request
 import traceback
 import threading, time
 
+import numpy as np
+import cv2
+import queue
+from webapp.model.yolo_augv import AgentYoloThread, agent_queues, agent_state
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger("asgi_app")
@@ -41,41 +46,56 @@ async def augv_ws(websocket: WebSocket):
     agent_id = websocket.path_params["agent_id"]
     await websocket.accept()
     log_agent_event(agent_id, "connected")
+
+    if agent_id not in agent_queues:
+        AgentYoloThread(agent_id).start()
+
+    AGENT_BROADCAST_INTERVAL = 0.2  # seconds
+    last_sent = 0
+
     try:
         while True:
+            data = await websocket.receive_bytes()
+            agent_frames[agent_id] = data
             try:
-                # Directly await receive_bytes with timeout for heartbeat
-                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=HEARTBEAT_TIMEOUT)
-                agent_frames[agent_id] = data
-                # Broadcast to all monitor clients with agent_id header
-                header = json.dumps({"agent_id": agent_id}).encode() + b'\n'
-                send_tasks = []
-                for client in list(monitor_clients):
-                    send_tasks.append(client.send_bytes(header + data))
-                # Gather all sends in parallel, don't let one slow client block others
+                frame_np = np.frombuffer(data, dtype=np.uint8)
+                frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    if not agent_queues[agent_id].full():
+                        agent_queues[agent_id].put_nowait(frame)
+            
+            except Exception as e:
+                log_agent_event(agent_id, f"frame decode error: {e}")
+
+            now = time.time()
+            if now >= last_sent:
+                last_sent = now
+                header = json.dumps({
+                    "agent_id": agent_id,
+                    "detections": agent_state.get(agent_id, {}).get("detections", [])
+                }).encode() + b'\n'
+                payload = header + data
+
+                send_tasks = [client.send_bytes(payload) for client in list(monitor_clients)]
                 results = await asyncio.gather(*send_tasks, return_exceptions=True)
-                dead_clients = set()
+
                 for client, result in zip(list(monitor_clients), results):
                     if isinstance(result, Exception):
                         log_monitor_event(f"Client send failed: {result}\n{traceback.format_exc()}")
-                        dead_clients.add(client)
-                for dc in dead_clients:
-                    monitor_clients.discard(dc)
-                if len(agent_frames) % 10 == 0:
-                    log_resource_usage()
-            except asyncio.TimeoutError:
-                log_agent_event(agent_id, f"heartbeat timeout ({HEARTBEAT_TIMEOUT}s), closing connection")
-                break
-            except Exception as e:
-                log_agent_event(agent_id, f"frame receive/send error: {e}\n{traceback.format_exc()}")
-                break
+                        monitor_clients.discard(client)
+                    
+            if len(agent_frames) % 10 == 0:
+                log_resource_usage()  
+            
     except WebSocketDisconnect:
         log_agent_event(agent_id, "disconnected (WebSocketDisconnect)")
+
     except Exception as e:
         log_agent_event(agent_id, f"disconnected (Exception): {e}\n{traceback.format_exc()}")
+
     finally:
         log_agent_event(agent_id, "connection closed")
-        # Optionally: agent_frames.pop(agent_id, None)
+        agent_frames.pop(agent_id, None)
 
 # WebSocket endpoint for frontend monitor
 async def monitor_ws(websocket: WebSocket):
@@ -83,26 +103,28 @@ async def monitor_ws(websocket: WebSocket):
     monitor_clients.add(websocket)
     log_monitor_event(f"client connected (total: {len(monitor_clients)})")
     # On connect, send latest frame for each agent
-    for agent_id, frame in agent_frames.items():
-        try:
-            header = json.dumps({"agent_id": agent_id}).encode() + b'\n'
-            await asyncio.wait_for(websocket.send_bytes(header + frame), timeout=2)
-            log_monitor_event(f"sent latest frame for {agent_id} to new monitor client")
-        except Exception as e:
-            log_monitor_event(f"failed to send initial frame for {agent_id}: {e}\n{traceback.format_exc()}")
     try:
-        while True:
-            # Heartbeat: send ping every HEARTBEAT_INTERVAL seconds
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
+        for agent_id, frame in agent_frames.items():
             try:
-                await asyncio.wait_for(websocket.send_bytes(b''), timeout=2)  # Send empty ping
+                header = json.dumps({"agent_id": agent_id}).encode() + b'\n'
+                await websocket.send_bytes(header + frame)
+        
+            except WebSocketDisconnect:
+                log_monitor_event("monitor disconnected (WebSocketDisconnect)")
+
             except Exception as e:
-                log_monitor_event(f"heartbeat/ping failed: {e}\n{traceback.format_exc()}")
-                break
+                log_monitor_event(f"failed to send initial frame for {agent_id}: {e}\n{traceback.format_exc()}")
+        
+        while True:
+            # Just keep the socket open and do nothing
+            await asyncio.sleep(10)
+
     except WebSocketDisconnect:
         log_monitor_event("client disconnected (WebSocketDisconnect)")
+
     except Exception as e:
         log_monitor_event(f"client disconnected (Exception): {e}\n{traceback.format_exc()}")
+
     finally:
         monitor_clients.discard(websocket)
         log_monitor_event(f"client removed (total: {len(monitor_clients)})")
@@ -141,7 +163,12 @@ async def monitor(request: Request):
 
 # Health check endpoint
 async def health(request: Request):
-    return JSONResponse({"status": "ok", "agents": list(agent_frames.keys()), "monitors": len(monitor_clients)})
+    return JSONResponse({
+        "status": "ok", 
+        "agents": list(agent_frames.keys()), 
+        "monitors": len(monitor_clients),
+        "yolo": {agent_id: state for agent_id, state in agent_state.items() if isinstance(state, dict)}
+    })
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 
@@ -160,4 +187,5 @@ def log_resources():
         p = psutil.Process(os.getpid())
         print(f"[RESOURCE] Mem: {p.memory_info().rss/1024/1024:.2f}MB, FDs: {p.num_fds() if hasattr(p, 'num_fds') else 'N/A'}")
         time.sleep(10)
+
 threading.Thread(target=log_resources, daemon=True).start() 
