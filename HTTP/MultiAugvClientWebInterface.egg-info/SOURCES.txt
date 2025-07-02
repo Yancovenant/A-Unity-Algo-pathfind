@@ -1,0 +1,15 @@
+setup.py
+MultiAugvClientWebInterface.egg-info/PKG-INFO
+MultiAugvClientWebInterface.egg-info/SOURCES.txt
+MultiAugvClientWebInterface.egg-info/dependency_links.txt
+MultiAugvClientWebInterface.egg-info/entry_points.txt
+MultiAugvClientWebInterface.egg-info/requires.txt
+MultiAugvClientWebInterface.egg-info/top_level.txt
+webapp/__init__.py
+webapp/__main__.py
+webapp/agent_stream.py
+webapp/asgi_app.py
+webapp/layout.py
+webapp/qweb.py
+webapp/router.py
+webapp/server.py

@@ -1,0 +1,23 @@
+<html>
+  <head>
+    <title>YOLO Monitor</title>
+    <style>
+      body { font-family: sans-serif; background: #f9f9f9; padding: 10px; }
+      .agent { display: inline-block; margin: 10px; padding: 10px; background: #fff; border-radius: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.1); }
+      .agent-name { font-weight: bold; margin-bottom: 5px; }
+      canvas { border: 1px solid #ccc; width: 160px; height: 120px; display: block; }
+    </style>
+  </head>
+  <body>
+    <h2>YOLO Monitor</h2>
+    <div id="agents">
+      <t-foreach expr="agents" as="agent">
+        <div class="agent" id="agent-<t-out expr='agent'/>">
+          <div class="agent-name"><t-out expr="agent"/></div>
+          <canvas id="canvas-<t-out expr='agent'/>" width="160" height="120"></canvas>
+        </div>
+      </t-foreach>
+    </div>
+    <script src="/static/src/js/monitor.js"></script>
+  </body>
+</html> 

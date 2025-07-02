@@ -1,0 +1,163 @@
+import os
+import asyncio
+import json
+import logging
+import psutil
+from starlette.applications import Starlette
+from starlette.responses import HTMLResponse, JSONResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.staticfiles import StaticFiles
+from starlette.websockets import WebSocket, WebSocketDisconnect
+from starlette.requests import Request
+import traceback
+import threading, time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logger = logging.getLogger("asgi_app")
+
+# In-memory storage for latest frames and monitor clients
+agent_frames = {}  # {agent_id: bytes}
+monitor_clients = set()  # Set[WebSocket]
+
+# Heartbeat settings
+HEARTBEAT_INTERVAL = 20  # seconds
+HEARTBEAT_TIMEOUT = 40   # seconds
+
+# Log memory/resource usage for debugging
+def log_resource_usage():
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / (1024 * 1024)
+    logger.info(f"[RESOURCE] Memory: {mem:.2f} MB, Monitor clients: {len(monitor_clients)}, Agents: {len(agent_frames)}")
+
+# WebSocket endpoint for Unity agents
+def log_agent_event(agent_id, msg):
+    logger.info(f"[AUGV {agent_id}] {msg}")
+
+def log_monitor_event(msg):
+    logger.info(f"[MONITOR] {msg}")
+
+async def augv_ws(websocket: WebSocket):
+    agent_id = websocket.path_params["agent_id"]
+    await websocket.accept()
+    log_agent_event(agent_id, "connected")
+    try:
+        while True:
+            try:
+                # Directly await receive_bytes with timeout for heartbeat
+                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=HEARTBEAT_TIMEOUT)
+                agent_frames[agent_id] = data
+                # Broadcast to all monitor clients with agent_id header
+                header = json.dumps({"agent_id": agent_id}).encode() + b'\n'
+                send_tasks = []
+                for client in list(monitor_clients):
+                    send_tasks.append(client.send_bytes(header + data))
+                # Gather all sends in parallel, don't let one slow client block others
+                results = await asyncio.gather(*send_tasks, return_exceptions=True)
+                dead_clients = set()
+                for client, result in zip(list(monitor_clients), results):
+                    if isinstance(result, Exception):
+                        log_monitor_event(f"Client send failed: {result}\n{traceback.format_exc()}")
+                        dead_clients.add(client)
+                for dc in dead_clients:
+                    monitor_clients.discard(dc)
+                if len(agent_frames) % 10 == 0:
+                    log_resource_usage()
+            except asyncio.TimeoutError:
+                log_agent_event(agent_id, f"heartbeat timeout ({HEARTBEAT_TIMEOUT}s), closing connection")
+                break
+            except Exception as e:
+                log_agent_event(agent_id, f"frame receive/send error: {e}\n{traceback.format_exc()}")
+                break
+    except WebSocketDisconnect:
+        log_agent_event(agent_id, "disconnected (WebSocketDisconnect)")
+    except Exception as e:
+        log_agent_event(agent_id, f"disconnected (Exception): {e}\n{traceback.format_exc()}")
+    finally:
+        log_agent_event(agent_id, "connection closed")
+        # Optionally: agent_frames.pop(agent_id, None)
+
+# WebSocket endpoint for frontend monitor
+async def monitor_ws(websocket: WebSocket):
+    await websocket.accept()
+    monitor_clients.add(websocket)
+    log_monitor_event(f"client connected (total: {len(monitor_clients)})")
+    # On connect, send latest frame for each agent
+    for agent_id, frame in agent_frames.items():
+        try:
+            header = json.dumps({"agent_id": agent_id}).encode() + b'\n'
+            await asyncio.wait_for(websocket.send_bytes(header + frame), timeout=2)
+            log_monitor_event(f"sent latest frame for {agent_id} to new monitor client")
+        except Exception as e:
+            log_monitor_event(f"failed to send initial frame for {agent_id}: {e}\n{traceback.format_exc()}")
+    try:
+        while True:
+            # Heartbeat: send ping every HEARTBEAT_INTERVAL seconds
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            try:
+                await asyncio.wait_for(websocket.send_bytes(b''), timeout=2)  # Send empty ping
+            except Exception as e:
+                log_monitor_event(f"heartbeat/ping failed: {e}\n{traceback.format_exc()}")
+                break
+    except WebSocketDisconnect:
+        log_monitor_event("client disconnected (WebSocketDisconnect)")
+    except Exception as e:
+        log_monitor_event(f"client disconnected (Exception): {e}\n{traceback.format_exc()}")
+    finally:
+        monitor_clients.discard(websocket)
+        log_monitor_event(f"client removed (total: {len(monitor_clients)})")
+        log_resource_usage()
+
+# HTTP endpoint for /monitor
+async def monitor(request: Request):
+    EXPECTED_AGENTS = [f"AUGV_{i}" for i in range(1, 6)]
+    agents = list(set(agent_frames.keys()) | set(EXPECTED_AGENTS))
+    html = """
+    <html><head>
+    <title>YOLO Monitor</title>
+    <style>
+    body { font-family: sans-serif; background: #f9f9f9; padding: 10px; }
+    .agent { display: inline-block; margin: 10px; padding: 10px; background: #fff; border-radius: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.1); }
+    .agent-name { font-weight: bold; margin-bottom: 5px; }
+    canvas { border: 1px solid #ccc; width: 160px; height: 120px; display: block; }
+    </style>
+    </head><body>
+    <h2>YOLO Monitor</h2>
+    <div id="agents">
+    """
+    for agent in agents:
+        html += f'''
+        <div class="agent" id="agent-{agent}">
+            <div class="agent-name">{agent}</div>
+            <canvas id="canvas-{agent}" width="160" height="120"></canvas>
+        </div>
+        '''
+    html += """
+    </div>
+    <script src="/static/src/js/monitor.js"></script>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+# Health check endpoint
+async def health(request: Request):
+    return JSONResponse({"status": "ok", "agents": list(agent_frames.keys()), "monitors": len(monitor_clients)})
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+
+routes = [
+    WebSocketRoute("/ws/augv/{agent_id}", augv_ws),
+    WebSocketRoute("/ws/monitor", monitor_ws),
+    Route("/monitor", monitor, methods=["GET"]),
+    Route("/health", health, methods=["GET"]),
+]
+
+app = Starlette(debug=False, routes=routes)
+app.mount("/static", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+
+def log_resources():
+    while True:
+        p = psutil.Process(os.getpid())
+        print(f"[RESOURCE] Mem: {p.memory_info().rss/1024/1024:.2f}MB, FDs: {p.num_fds() if hasattr(p, 'num_fds') else 'N/A'}")
+        time.sleep(10)
+threading.Thread(target=log_resources, daemon=True).start() 

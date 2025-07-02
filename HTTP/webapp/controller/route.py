@@ -55,7 +55,6 @@ def stream_yolo_image(request: Request, agent_id: str):
 def monitor_yolo_all(request: Request):
     html = """
     <html><head>
-        <meta http-equiv="refresh" content="1">
         <style>
             body { font-family: sans-serif; background: #f9f9f9; padding: 10px; }
             .agent { display: inline-block; margin: 10px; padding: 10px; background: #fff; border-radius: 5px; box-shadow: 0 0 5px rgba(0,0,0,0.1); }
