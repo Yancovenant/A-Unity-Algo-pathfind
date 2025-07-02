@@ -5,6 +5,7 @@ import queue
 import os
 import numpy as np
 import cv2
+import base64
 from ultralytics import YOLO
 
 # Internal state
@@ -15,8 +16,8 @@ agent_state = {}   # { agent_id: { "status": "safe" | "obstacle", "detections": 
 IMAGE_SAVE_DIR = os.path.join(os.getcwd(), "debug_yolo_images")
 os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
 
-ALLOWED_CLASSES = {"person", "obstacle"}  # Customize this
-DEBUG = False  # Set to True to save .jpg debug images
+ALLOWED_CLASSES = {"person", "obstacle"}
+DEBUG = True  # Set to True to save .jpg debug images
 
 class AgentYoloThread(threading.Thread):
     def __init__(self, agent_id):
@@ -28,7 +29,8 @@ class AgentYoloThread(threading.Thread):
     
     def run(self):
         try:
-            model = YOLO("yolov8n.pt")
+            model = YOLO("yolov8n-seg.pt")
+            print("[YOLO] Model classes:", model.names)
         except Exception as e:
             agent_state[self.agent_id] = {'status': 'error', 'error': str(e)}
             return
@@ -39,17 +41,18 @@ class AgentYoloThread(threading.Thread):
                 if frame is None:
                     continue
 
-                image = np.frombuffer(frame, dtype=np.uint8).reshape((120, 160, 3)).copy()
-
-                results = model.predict(image, verbose=False)[0]
+                image = np.ascontiguousarray(frame)
+                results = model.predict(image, classes=None, conf=0.4, verbose=False)[0]
 
                 detections = []
-                for box in results.boxes:
+                for box in getattr(results, "boxes", []):
                     cls_id = int(box.cls[0])
                     label = model.names[cls_id]
+                    print(f"[YOLO] Detected: {label}")
+                    """
                     if ALLOWED_CLASSES and label not in ALLOWED_CLASSES:
                         continue
-
+                    """
                     conf = float(box.conf[0])
                     xywh = box.xywh[0].tolist()
 
