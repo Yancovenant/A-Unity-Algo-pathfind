@@ -1,5 +1,7 @@
 // monitor.js: Live video for YOLO Monitor
+
 (function() {
+    /**
   // Map agentId -> canvas context
   const canvases = {};
   document.querySelectorAll('canvas[id^="canvas-"]').forEach(canvas => {
@@ -36,4 +38,60 @@
   ws.onclose = function() {
     console.log('[Monitor] Disconnected from backend');
   };
+   */
+    const canvases = {};
+    const socket = new WebSocket("ws://" + location.host + "/ws/monitor");
+    socket.binaryType = "arraybuffer";
+
+    socket.onmessage = (event) => {
+        const data = new Uint8Array(event.data);
+        const newlineIndex = data.indexOf(10); // '\n'
+
+        if (newlineIndex === -1) return;
+
+        const header = JSON.parse(new TextDecoder().decode(data.slice(0, newlineIndex)));
+        const imageData = data.slice(newlineIndex + 1);
+        const agentId = header.agent_id;
+        const detections = header.detections || [];
+
+        const canvas = document.getElementById("canvas-" + agentId);
+        if (!canvas) return;
+
+        const ctx = canvas.getContext("2d");
+
+        const blob = new Blob([imageData], { type: "image/jpeg" });
+        const img = new Image();
+        img.onload = () => {
+            
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            
+            //canvas.width = img.width;
+            //canvas.height = img.height;
+            //ctx.drawImage(img, 0, 0);
+
+            // Draw detections
+            detections.forEach(det => {
+                const [x, y, w, h] = det.bbox;
+                const left = (x - w / 2) * (canvas.width / img.width);
+                const top  = (y - h / 2) * (canvas.height / img.height);
+                const boxW = w * (canvas.width / img.width);
+                const boxH = h * (canvas.height / img.height);
+                //const left = x - w / 2;
+                //const top = y - h / 2;
+
+                ctx.strokeStyle = "lime";
+                ctx.lineWidth = 1;
+                //ctx.strokeRect(left, top, w, h);
+                ctx.strokeRect(left, top, boxW, boxH);
+
+                ctx.font = "10px sans-serif";
+                ctx.fillStyle = "lime";
+                ctx.fillText(`${det.label} ${det.confidence}`, left, top - 2);
+            });
+        };
+        img.src = URL.createObjectURL(blob);
+    };
 })(); 
+
+
