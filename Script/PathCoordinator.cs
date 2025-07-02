@@ -142,11 +142,11 @@ public class PathCoordinator : MonoBehaviour {
             activeAgents.Clear();
             
             ResolveContestedNodes();
-            StartCoroutine(CheckAndAdvanceAgents());
+            //StartCoroutine(CheckAndAdvanceAgents());
             foreach (var a in readyAgents) {
                 //CameraCaptureSocket capture = agent.GetComponentInChildren<CameraCaptureSocket>();
                 //capture?.CaptureAndSend();
-                //a.Advance();
+                a.Advance();
             }
         }
         TrimPathsToAgentPosition();
