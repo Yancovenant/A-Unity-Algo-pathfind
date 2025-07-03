@@ -72,7 +72,8 @@ async def augv_ws(websocket: WebSocket):
                 last_sent = now
                 header = json.dumps({
                     "agent_id": agent_id,
-                    "detections": agent_state.get(agent_id, {}).get("detections", [])
+                    "detections": agent_state.get(agent_id, {}).get("detections", []),
+                    "road_outline": agent_state.get(agent_id, {}).get("road_outline", [])
                 }).encode() + b'\n'
                 payload = header + data
 
@@ -151,7 +152,7 @@ async def monitor(request: Request):
         html += f'''
         <div class="agent" id="agent-{agent}">
             <div class="agent-name">{agent}</div>
-            <canvas id="canvas-{agent}" width="160" height="120"></canvas>
+            <canvas id="canvas-{agent}" width="640" height="480"></canvas>
         </div>
         '''
     html += """
