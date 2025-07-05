@@ -1,58 +1,37 @@
-import os
-import asyncio
-import json
-import logging
-import psutil
+# asgi_app.py
+# Starlette ASGI app for AUGV YOLO backend: handles agent/monitor websockets, HTTP endpoints, and resource logging.
+
+import os, asyncio, json, logging, psutil, threading, time, numpy as np, cv2, queue, traceback
 from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from starlette.requests import Request
-import traceback
-import threading, time
-
-import numpy as np
-import cv2
-import queue
 from webapp.model.yolo_augv import AgentYoloThread, agent_queues, agent_state
 
-# Configure logging
+# Logging setup
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger("asgi_app")
 
-# In-memory storage for latest frames and monitor clients
+# In-memory state
 agent_frames = {}  # {agent_id: bytes}
 monitor_clients = set()  # Set[WebSocket]
+HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT = 20, 40
 
-# Heartbeat settings
-HEARTBEAT_INTERVAL = 20  # seconds
-HEARTBEAT_TIMEOUT = 40   # seconds
+# Resource usage logging
+log_resource_usage = lambda: logger.info(f"[RESOURCE] Memory: {psutil.Process(os.getpid()).memory_info().rss/1024/1024:.2f} MB, Monitor clients: {len(monitor_clients)}, Agents: {len(agent_frames)}")
 
-# Log memory/resource usage for debugging
-def log_resource_usage():
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / (1024 * 1024)
-    logger.info(f"[RESOURCE] Memory: {mem:.2f} MB, Monitor clients: {len(monitor_clients)}, Agents: {len(agent_frames)}")
+def log_agent_event(agent_id, msg): logger.info(f"[AUGV {agent_id}] {msg}")
+def log_monitor_event(msg): logger.info(f"[MONITOR] {msg}")
 
 # WebSocket endpoint for Unity agents
-def log_agent_event(agent_id, msg):
-    logger.info(f"[AUGV {agent_id}] {msg}")
-
-def log_monitor_event(msg):
-    logger.info(f"[MONITOR] {msg}")
-
 async def augv_ws(websocket: WebSocket):
     agent_id = websocket.path_params["agent_id"]
     await websocket.accept()
     log_agent_event(agent_id, "connected")
-
-    if agent_id not in agent_queues:
-        AgentYoloThread(agent_id).start()
-
-    AGENT_BROADCAST_INTERVAL = 0.2  # seconds
-    last_sent = 0
-
+    if agent_id not in agent_queues: AgentYoloThread(agent_id).start()
+    AGENT_BROADCAST_INTERVAL, last_sent = 0.2, 0
     try:
         while True:
             data = await websocket.receive_bytes()
@@ -60,13 +39,10 @@ async def augv_ws(websocket: WebSocket):
             try:
                 frame_np = np.frombuffer(data, dtype=np.uint8)
                 frame = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    if not agent_queues[agent_id].full():
-                        agent_queues[agent_id].put_nowait(frame)
-            
+                if frame is not None and not agent_queues[agent_id].full():
+                    agent_queues[agent_id].put_nowait(frame)
             except Exception as e:
                 log_agent_event(agent_id, f"frame decode error: {e}")
-
             now = time.time()
             if now >= last_sent:
                 last_sent = now
@@ -76,24 +52,17 @@ async def augv_ws(websocket: WebSocket):
                     "road_outline": agent_state.get(agent_id, {}).get("road_outline", [])
                 }).encode() + b'\n'
                 payload = header + data
-
                 send_tasks = [client.send_bytes(payload) for client in list(monitor_clients)]
                 results = await asyncio.gather(*send_tasks, return_exceptions=True)
-
                 for client, result in zip(list(monitor_clients), results):
                     if isinstance(result, Exception):
                         log_monitor_event(f"Client send failed: {result}\n{traceback.format_exc()}")
                         monitor_clients.discard(client)
-                    
-            if len(agent_frames) % 10 == 0:
-                log_resource_usage()  
-            
+            if len(agent_frames) % 10 == 0: log_resource_usage()
     except WebSocketDisconnect:
         log_agent_event(agent_id, "disconnected (WebSocketDisconnect)")
-
     except Exception as e:
         log_agent_event(agent_id, f"disconnected (Exception): {e}\n{traceback.format_exc()}")
-
     finally:
         log_agent_event(agent_id, "connection closed")
         agent_frames.pop(agent_id, None)
@@ -103,29 +72,20 @@ async def monitor_ws(websocket: WebSocket):
     await websocket.accept()
     monitor_clients.add(websocket)
     log_monitor_event(f"client connected (total: {len(monitor_clients)})")
-    # On connect, send latest frame for each agent
     try:
         for agent_id, frame in agent_frames.items():
             try:
                 header = json.dumps({"agent_id": agent_id}).encode() + b'\n'
                 await websocket.send_bytes(header + frame)
-        
             except WebSocketDisconnect:
                 log_monitor_event("monitor disconnected (WebSocketDisconnect)")
-
             except Exception as e:
                 log_monitor_event(f"failed to send initial frame for {agent_id}: {e}\n{traceback.format_exc()}")
-        
-        while True:
-            # Just keep the socket open and do nothing
-            await asyncio.sleep(10)
-
+        while True: await asyncio.sleep(10)
     except WebSocketDisconnect:
         log_monitor_event("client disconnected (WebSocketDisconnect)")
-
     except Exception as e:
         log_monitor_event(f"client disconnected (Exception): {e}\n{traceback.format_exc()}")
-
     finally:
         monitor_clients.discard(websocket)
         log_monitor_event(f"client removed (total: {len(monitor_clients)})")
@@ -165,8 +125,8 @@ async def monitor(request: Request):
 # Health check endpoint
 async def health(request: Request):
     return JSONResponse({
-        "status": "ok", 
-        "agents": list(agent_frames.keys()), 
+        "status": "ok",
+        "agents": list(agent_frames.keys()),
         "monitors": len(monitor_clients),
         "yolo": {agent_id: state for agent_id, state in agent_state.items() if isinstance(state, dict)}
     })
