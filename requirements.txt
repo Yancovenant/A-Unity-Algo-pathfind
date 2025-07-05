@@ -6,3 +6,4 @@ starlette
 uvicorn[standard]
 websockets
 wsproto
+opencv-python-headless
