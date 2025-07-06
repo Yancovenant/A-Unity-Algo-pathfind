@@ -1,6 +1,0 @@
-werkzeug
-requests
-opencv-python
-ultralytics
-starlette
-uvicorn

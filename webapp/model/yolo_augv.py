@@ -111,6 +111,7 @@ class AgentYoloThread(threading.Thread):
             try:
                 frame = self.q.get()
                 if frame is None: continue
+                print(f"[AUGV {self.agent_id}] Frame received. Shape: {frame.shape}")
                 now = time.time()
                 image = np.ascontiguousarray(frame)
                 img_h, img_w = image.shape[:2]

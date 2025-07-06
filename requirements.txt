@@ -3,6 +3,7 @@ requests
 opencv-python
 ultralytics
 starlette
+psutil
 uvicorn[standard]
 websockets
 wsproto
